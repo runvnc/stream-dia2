@@ -7,12 +7,8 @@ authors = [
   { name = "runvnc" }
 ]
 
-# Runtime deps for the server
 dependencies = [
-  "dia2 @ git+https://github.com/nari-labs/dia2.git",
-  # IMPORTANT: use a specific tag/commit that matches the layout we cloned locally.
-  # Using the root of the repo ensures `dia2.core` exists.
-  "dia2 @ git+https://github.com/nari-labs/dia2.git",
+  "dia2",
   "fastapi",
   "uvicorn[standard]",
   "numpy",
@@ -44,5 +40,18 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools]
 packages = ["stream_dia2_client"]
 
-# Added Dia2 from GitHub as a dependency
-# NOTE: uv/pip will install from this repo URL.
+[tool.uv]
+package = true
+
+[tool.uv.sources]
+dia2 = { path = "dia2_repo", editable = true }
+
+# PyTorch CUDA wheels
+torch = [
+  { index = "pytorch-cu128", marker = "sys_platform == 'linux'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
