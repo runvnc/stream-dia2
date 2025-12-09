@@ -8,11 +8,18 @@ authors = [
 ]
 
 dependencies = [
-  "dia2",
+  # dia2 dependencies (vendored)
+  "torch>=2.8.0",
+  "numpy>=2.1.0,<3.0",
+  "transformers>=4.55.3",
+  "safetensors==0.5.3",
+  "huggingface-hub>=0.24.7",
+  "sphn>=0.2.0",
+  "soundfile>=0.12.1",
+  "whisper-timestamped>=1.14.2",
+  # server dependencies
   "fastapi",
   "uvicorn[standard]",
-  "numpy",
-  "torch",
   "websockets",
   "sounddevice",
 ]
@@ -21,8 +28,6 @@ dependencies = [
 server = [
   "fastapi",
   "uvicorn[standard]",
-  "numpy",
-  "torch",
 ]
 client = [
   "websockets",
@@ -37,16 +42,15 @@ stream-dia2-client = "stream_dia2_client.__main__:main"
 requires = ["setuptools", "wheel"]
 build-backend = "setuptools.build_meta"
 
-[tool.setuptools]
-packages = ["stream_dia2_client"]
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["stream_dia2_client*", "dia2*"]
 
 [tool.uv]
 package = true
 
-[tool.uv.sources]
-dia2 = { path = "dia2_repo", editable = true }
-
 # PyTorch CUDA wheels
+[tool.uv.sources]
 torch = [
   { index = "pytorch-cu128", marker = "sys_platform == 'linux'" },
 ]
