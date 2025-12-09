@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple, Any
 
 import torch
 from torch import nn
@@ -47,10 +47,36 @@ class MimiCodec(nn.Module):
         return cls(model, device)
 
     def decode(self, codes: torch.Tensor) -> torch.Tensor:
+        """Decode audio codes to waveform (non-streaming)."""
         codes = codes.to(self.device)
         with torch.inference_mode():
             audio, _ = self.model.decode(codes, return_dict=False)
             return torch.clamp(audio, -1.0, 1.0)
+
+    def decode_streaming(
+        self,
+        codes: torch.Tensor,
+        past_key_values: Optional[Any] = None,
+    ) -> Tuple[torch.Tensor, Any]:
+        """
+        Decode audio codes with streaming support using KV cache.
+        
+        Args:
+            codes: Audio codes to decode, shape (batch, num_codebooks, frames)
+            past_key_values: Previous decoder cache for incremental decoding
+            
+        Returns:
+            Tuple of (audio_waveform, new_past_key_values)
+        """
+        codes = codes.to(self.device)
+        with torch.inference_mode():
+            result = self.model.decode(
+                codes,
+                decoder_past_key_values=past_key_values,
+                return_dict=True,
+            )
+            audio = torch.clamp(result.audio_values, -1.0, 1.0)
+            return audio, result.decoder_past_key_values
 
     def encode(self, audio: torch.Tensor, *, return_dict: bool = False):
         audio = audio.to(self.device)
