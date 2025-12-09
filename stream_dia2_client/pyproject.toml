@@ -1,0 +1,21 @@
+[project]
+name = "stream-dia2-client"
+version = "0.1.0"
+description = "CLI WebSocket client for streaming audio from a Dia2 server"
+requires-python = ">=3.10"
+authors = [
+  { name = "runvnc" }
+]
+
+dependencies = [
+  "websockets",
+  "sounddevice",
+  "numpy",
+]
+
+[project.scripts]
+stream-dia2-client = "stream_dia2_client.__main__:main"
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"

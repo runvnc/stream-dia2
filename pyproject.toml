@@ -1,0 +1,41 @@
+[project]
+name = "stream-dia2"
+version = "0.1.0"
+description = "FastAPI streaming server for Dia2 TTS, plus CLI WebSocket client"
+requires-python = ">=3.10"
+authors = [
+  { name = "runvnc" }
+]
+
+# Runtime deps for the server; dia2 itself must be installed separately
+dependencies = [
+  "fastapi",
+  "uvicorn[standard]",
+  "numpy",
+  "torch",
+  "websockets",
+  "sounddevice",
+]
+
+[project.optional-dependencies]
+server = [
+  "fastapi",
+  "uvicorn[standard]",
+  "numpy",
+  "torch",
+]
+client = [
+  "websockets",
+  "sounddevice",
+  "numpy",
+]
+
+[project.scripts]
+stream-dia2-client = "stream_dia2_client.__main__:main"
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["stream_dia2_client"]
