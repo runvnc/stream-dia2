@@ -15,6 +15,7 @@ WS_MAX_SIZE = 16 * 1024 * 1024
 
 # Default CFG scale (1.0 = no guidance, higher = stronger voice matching)
 DEFAULT_CFG_SCALE = 3.0
+DEFAULT_TEMPERATURE = 0.8
 
 
 def pcm16_to_float(pcm: bytes) -> np.ndarray:
@@ -43,6 +44,7 @@ class Dia2Client:
         self.sample_rate: int = 24000
         self.stream: Optional[sd.OutputStream] = None
         self.cfg_scale: float = DEFAULT_CFG_SCALE
+        self.temperature: float = DEFAULT_TEMPERATURE
     
     async def connect(self) -> None:
         """Connect to the server."""
@@ -112,6 +114,7 @@ class Dia2Client:
         self,
         text: str,
         include_prefix: bool = False,
+        temperature: Optional[float] = None,
         cfg_scale: Optional[float] = None,
     ) -> None:
         """Generate and play TTS for the given text."""
@@ -122,6 +125,7 @@ class Dia2Client:
             "type": "tts",
             "text": text,
             "include_prefix": include_prefix,
+            "temperature": temperature if temperature is not None else self.temperature,
             "cfg_scale": cfg_scale if cfg_scale is not None else self.cfg_scale,
         }
         
@@ -198,6 +202,7 @@ async def interactive_mode(
     ws_url: str = "ws://localhost:8000/ws/stream_tts",
     speaker_1_path: Optional[str] = None,
     speaker_2_path: Optional[str] = None,
+    temperature: float = DEFAULT_TEMPERATURE,
     cfg_scale: float = DEFAULT_CFG_SCALE,
 ) -> None:
     """Interactive mode with persistent connection."""
@@ -206,6 +211,7 @@ async def interactive_mode(
     
     client = Dia2Client(ws_url)
     client.cfg_scale = cfg_scale
+    client.temperature = temperature
     await client.connect()
     
     # Set voice if provided
@@ -216,12 +222,13 @@ async def interactive_mode(
     print("  /voice <path>     - Set speaker 1 voice")
     print("  /voice2 <path>    - Set speaker 2 voice")
     print("  /voices <p1> <p2> - Set both voices at once")
-    print("  /cfg <value>      - Set CFG scale (default: 3.0, range: 1.0-10.0)")
+    print("  /cfg <value>      - Set CFG scale (default: 3.0)")
+    print("  /temp <value>     - Set temperature (default: 0.8)")
     print("  /s2 <text>        - Speak as Speaker 2")
     print("  /both <s1> | <s2> - Dialogue")
     print("  /quit             - Exit")
     print("  <text>            - Speak as Speaker 1")
-    print(f"\nCurrent CFG scale: {client.cfg_scale}")
+    print(f"\nCurrent settings: cfg={client.cfg_scale}, temp={client.temperature}")
     print("==============================\n")
     
     try:
@@ -246,6 +253,15 @@ async def interactive_mode(
                     print(f"  CFG scale set to {val}")
                 except ValueError:
                     print("  Usage: /cfg <number> (e.g., /cfg 3.0)")
+                continue
+            
+            if user_input.lower().startswith("/temp "):
+                try:
+                    val = float(user_input[6:].strip())
+                    client.temperature = val
+                    print(f"  Temperature set to {val}")
+                except ValueError:
+                    print("  Usage: /temp <number> (e.g., /temp 0.8)")
                 continue
             
             if user_input.lower().startswith("/voices "):
@@ -296,6 +312,7 @@ async def single_shot(
     speaker_1_path: Optional[str] = None,
     speaker_2_path: Optional[str] = None,
     include_prefix: bool = False,
+    temperature: float = DEFAULT_TEMPERATURE,
     cfg_scale: float = DEFAULT_CFG_SCALE,
 ) -> None:
     """Single TTS request."""
@@ -306,7 +323,7 @@ async def single_shot(
     if speaker_1_path or speaker_2_path:
         await client.set_voice(speaker_1_path, speaker_2_path)
     
-    await client.speak(text, include_prefix=include_prefix)
+    await client.speak(text, include_prefix=include_prefix, temperature=temperature, cfg_scale=cfg_scale)
     await client.close()
 
 
@@ -319,6 +336,7 @@ def main() -> None:
     parser.add_argument("--url", default="ws://localhost:8000/ws/stream_tts", help="WebSocket URL")
     parser.add_argument("--voice", "--voice1", dest="voice1", help="Speaker 1 voice audio file")
     parser.add_argument("--voice2", help="Speaker 2 voice audio file")
+    parser.add_argument("--temp", type=float, default=DEFAULT_TEMPERATURE, help=f"Temperature (default: {DEFAULT_TEMPERATURE})")
     parser.add_argument("--cfg", type=float, default=DEFAULT_CFG_SCALE, help=f"CFG scale (default: {DEFAULT_CFG_SCALE})")
     parser.add_argument("--include-prefix", action="store_true", help="Include prefix audio in output")
     
@@ -329,6 +347,7 @@ def main() -> None:
             ws_url=args.url,
             speaker_1_path=args.voice1,
             speaker_2_path=args.voice2,
+            temperature=args.temp,
             cfg_scale=args.cfg,
         ))
         return
@@ -347,6 +366,7 @@ def main() -> None:
         speaker_1_path=args.voice1,
         speaker_2_path=args.voice2,
         include_prefix=args.include_prefix,
+        temperature=args.temp,
         cfg_scale=args.cfg,
     ))
 

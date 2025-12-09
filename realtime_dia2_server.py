@@ -194,8 +194,18 @@ def _cached_build_prefix_plan(runtime, prefix: Optional[PrefixConfig], **kwargs)
     # Debug: Show what entries were created
     if result:
         print(f"[Dia2] DEBUG: PrefixPlan has {len(result.entries)} entries, {result.aligned_frames} frames")
-        for i, entry in enumerate(result.entries[:5]):  # Show first 5
-            print(f"[Dia2] DEBUG:   Entry {i}: tokens={entry.tokens[:3]}... text='{entry.text}'")
+        # Show first 3 entries (should be S1)
+        for i, entry in enumerate(result.entries[:3]):
+            print(f"[Dia2] DEBUG:   S1 Entry {i}: tokens={entry.tokens[:5]}... text='{entry.text}'")
+        # Find where S2 starts (look for token 49153)
+        s2_start = None
+        for i, entry in enumerate(result.entries):
+            if entry.tokens and entry.tokens[0] == 49153:  # S2 token
+                s2_start = i
+                break
+        if s2_start:
+            for i, entry in enumerate(result.entries[s2_start:s2_start+3]):
+                print(f"[Dia2] DEBUG:   S2 Entry {s2_start+i}: tokens={entry.tokens[:5]}... text='{entry.text}'")
     
     return result
 
@@ -261,7 +271,7 @@ def _warmup_model() -> None:
             cfg_scale=2.0,
             text=SamplingConfig(temperature=0.6, top_k=50),
             audio=SamplingConfig(temperature=0.8, top_k=50),
-            use_cuda_graph=True,
+            use_cuda_graph=False,
         )
         print("[Dia2] Running warm-up generation...")
         _ = dia.generate("[S1] Warm up.", config=cfg, output_wav=None, verbose=False)
@@ -335,23 +345,24 @@ def _generate_tts(
     prefix_speaker_2: Optional[str] = None,
     include_prefix: bool = False,
     cfg_scale: float = 6.0,
-    text_temperature: float = 0.6,
-    audio_temperature: float = 0.8,
+    temperature: float = 0.8,
     top_k: int = 50,
+    use_cuda_graph: bool = False,  # Disabled by default like CLI
 ) -> List[AudioChunk]:
     """Generate TTS using dia2.generate() and return chunks."""
     t_start = time.perf_counter()
     print(f"[Dia2] Generating: {text[:80]}...")
     print(f"[Dia2] DEBUG _generate_tts: prefix_speaker_1={prefix_speaker_1}")
     print(f"[Dia2] DEBUG _generate_tts: prefix_speaker_2={prefix_speaker_2}")
-    print(f"[Dia2] DEBUG _generate_tts: cfg_scale={cfg_scale}")
-    print(f"[Dia2] DEBUG _generate_tts: text_temp={text_temperature}, audio_temp={audio_temperature}")
+    print(f"[Dia2] DEBUG _generate_tts: cfg_scale={cfg_scale}, temp={temperature}, cuda_graph={use_cuda_graph}")
     
+    # Use same temperature for both text and audio (like CLI does)
+    sampling = SamplingConfig(temperature=temperature, top_k=top_k)
     cfg = GenerationConfig(
         cfg_scale=cfg_scale,
-        text=SamplingConfig(temperature=text_temperature, top_k=top_k),
-        audio=SamplingConfig(temperature=audio_temperature, top_k=top_k),
-        use_cuda_graph=True,
+        text=sampling,
+        audio=sampling,
+        use_cuda_graph=use_cuda_graph,
     )
     
     t_before_gen = time.perf_counter()
@@ -507,9 +518,9 @@ async def stream_tts(ws: WebSocket):
                             prefix_speaker_2=prefix_speaker_2,
                             include_prefix=bool(payload.get("include_prefix", False)),
                             cfg_scale=float(payload.get("cfg_scale", 6.0)),
-                            text_temperature=float(payload.get("text_temperature", 0.6)),
-                            audio_temperature=float(payload.get("audio_temperature", 0.8)),
+                            temperature=float(payload.get("temperature", 0.8)),
                             top_k=int(payload.get("top_k", 50)),
+                            use_cuda_graph=bool(payload.get("use_cuda_graph", False)),
                         )
                     )
                 except Exception as e:
