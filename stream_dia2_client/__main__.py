@@ -13,6 +13,9 @@ import websockets
 # Increase max message size to 16MB for large audio chunks
 WS_MAX_SIZE = 16 * 1024 * 1024
 
+# Default CFG scale (1.0 = no guidance, higher = stronger voice matching)
+DEFAULT_CFG_SCALE = 3.0
+
 
 def pcm16_to_float(pcm: bytes) -> np.ndarray:
     """Convert 16-bit little-endian PCM bytes to float32 [-1, 1]."""
@@ -39,6 +42,7 @@ class Dia2Client:
         self.ws: Optional[websockets.WebSocketClientProtocol] = None
         self.sample_rate: int = 24000
         self.stream: Optional[sd.OutputStream] = None
+        self.cfg_scale: float = DEFAULT_CFG_SCALE
     
     async def connect(self) -> None:
         """Connect to the server."""
@@ -104,7 +108,12 @@ class Dia2Client:
             else:
                 print(f"[client] Unexpected response: {data}")
     
-    async def speak(self, text: str, include_prefix: bool = False) -> None:
+    async def speak(
+        self,
+        text: str,
+        include_prefix: bool = False,
+        cfg_scale: Optional[float] = None,
+    ) -> None:
         """Generate and play TTS for the given text."""
         if not self.ws:
             raise RuntimeError("Not connected")
@@ -113,6 +122,7 @@ class Dia2Client:
             "type": "tts",
             "text": text,
             "include_prefix": include_prefix,
+            "cfg_scale": cfg_scale if cfg_scale is not None else self.cfg_scale,
         }
         
         await self.ws.send(json.dumps(payload))
@@ -188,12 +198,14 @@ async def interactive_mode(
     ws_url: str = "ws://localhost:8000/ws/stream_tts",
     speaker_1_path: Optional[str] = None,
     speaker_2_path: Optional[str] = None,
+    cfg_scale: float = DEFAULT_CFG_SCALE,
 ) -> None:
     """Interactive mode with persistent connection."""
     print("\n=== Dia2 Interactive Mode ===")
     print("Connecting...")
     
     client = Dia2Client(ws_url)
+    client.cfg_scale = cfg_scale
     await client.connect()
     
     # Set voice if provided
@@ -204,10 +216,12 @@ async def interactive_mode(
     print("  /voice <path>     - Set speaker 1 voice")
     print("  /voice2 <path>    - Set speaker 2 voice")
     print("  /voices <p1> <p2> - Set both voices at once")
+    print("  /cfg <value>      - Set CFG scale (default: 3.0, range: 1.0-10.0)")
     print("  /s2 <text>        - Speak as Speaker 2")
     print("  /both <s1> | <s2> - Dialogue")
     print("  /quit             - Exit")
     print("  <text>            - Speak as Speaker 1")
+    print(f"\nCurrent CFG scale: {client.cfg_scale}")
     print("==============================\n")
     
     try:
@@ -224,6 +238,15 @@ async def interactive_mode(
             # Commands
             if user_input.lower() in ("/quit", "/q", "quit", "exit"):
                 break
+            
+            if user_input.lower().startswith("/cfg "):
+                try:
+                    val = float(user_input[5:].strip())
+                    client.cfg_scale = val
+                    print(f"  CFG scale set to {val}")
+                except ValueError:
+                    print("  Usage: /cfg <number> (e.g., /cfg 3.0)")
+                continue
             
             if user_input.lower().startswith("/voices "):
                 parts = user_input[8:].strip().split()
@@ -273,9 +296,11 @@ async def single_shot(
     speaker_1_path: Optional[str] = None,
     speaker_2_path: Optional[str] = None,
     include_prefix: bool = False,
+    cfg_scale: float = DEFAULT_CFG_SCALE,
 ) -> None:
     """Single TTS request."""
     client = Dia2Client(ws_url)
+    client.cfg_scale = cfg_scale
     await client.connect()
     
     if speaker_1_path or speaker_2_path:
@@ -294,6 +319,7 @@ def main() -> None:
     parser.add_argument("--url", default="ws://localhost:8000/ws/stream_tts", help="WebSocket URL")
     parser.add_argument("--voice", "--voice1", dest="voice1", help="Speaker 1 voice audio file")
     parser.add_argument("--voice2", help="Speaker 2 voice audio file")
+    parser.add_argument("--cfg", type=float, default=DEFAULT_CFG_SCALE, help=f"CFG scale (default: {DEFAULT_CFG_SCALE})")
     parser.add_argument("--include-prefix", action="store_true", help="Include prefix audio in output")
     
     args = parser.parse_args()
@@ -303,6 +329,7 @@ def main() -> None:
             ws_url=args.url,
             speaker_1_path=args.voice1,
             speaker_2_path=args.voice2,
+            cfg_scale=args.cfg,
         ))
         return
     
@@ -320,6 +347,7 @@ def main() -> None:
         speaker_1_path=args.voice1,
         speaker_2_path=args.voice2,
         include_prefix=args.include_prefix,
+        cfg_scale=args.cfg,
     ))
 
 
