@@ -5,10 +5,11 @@ import json
 import struct
 import tempfile
 import os
+import hashlib
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from queue import Queue, Empty
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 
 import numpy as np
 import torch
@@ -20,7 +21,7 @@ from dia2.runtime.generator import build_initial_state, warmup_with_prefix
 from dia2.runtime.streaming_generator import run_streaming_generation, StreamingChunk
 from dia2.runtime.script_parser import parse_script
 from dia2.runtime.voice_clone import build_prefix_plan
-from dia2.generation import merge_generation_config, normalize_script
+from dia2.generation import merge_generation_config, normalize_script, PrefixConfig
 
 
 app = FastAPI()
@@ -33,6 +34,9 @@ print(f"[Dia2] Initializing Dia2 from {MODEL_REPO} on {DEVICE} ({DTYPE})...")
 dia = Dia2.from_repo(MODEL_REPO, device=DEVICE, dtype=DTYPE)
 
 _cuda_executor = ThreadPoolExecutor(max_workers=1)
+
+# Cache for prefix plans (keyed by hash of voice file paths)
+_prefix_cache: Dict[str, Any] = {}
 
 
 def _warmup_model() -> None:
@@ -76,6 +80,40 @@ def save_audio_from_base64(audio_b64: str, suffix: str = ".wav") -> str:
     return path
 
 
+def _get_cache_key(speaker_1: Optional[str], speaker_2: Optional[str]) -> str:
+    """Generate cache key from voice file paths."""
+    key = f"{speaker_1 or ''}|{speaker_2 or ''}"
+    return hashlib.md5(key.encode()).hexdigest()
+
+
+def _build_and_cache_prefix(
+    runtime,
+    prefix_speaker_1: Optional[str],
+    prefix_speaker_2: Optional[str],
+) -> Any:
+    """Build prefix plan, using cache if available."""
+    cache_key = _get_cache_key(prefix_speaker_1, prefix_speaker_2)
+    
+    if cache_key in _prefix_cache:
+        print(f"[Dia2] Using cached prefix plan")
+        return _prefix_cache[cache_key]
+    
+    # Build prefix config
+    prefix_config = PrefixConfig(
+        speaker_1=prefix_speaker_1,
+        speaker_2=prefix_speaker_2,
+    )
+    
+    print(f"[Dia2] Building prefix plan (will be cached)...")
+    prefix_plan = build_prefix_plan(runtime, prefix_config)
+    
+    if prefix_plan is not None:
+        _prefix_cache[cache_key] = prefix_plan
+        print(f"[Dia2] Prefix plan cached")
+    
+    return prefix_plan
+
+
 def _run_streaming_generation(
     text: str,
     output_queue: Queue,
@@ -91,7 +129,6 @@ def _run_streaming_generation(
     """Run streaming generation and put chunks into the queue."""
     try:
         print(f"[Dia2] Generating: {text[:50]}...")
-        print(f"[Dia2] prefix_speaker_1={prefix_speaker_1}, prefix_speaker_2={prefix_speaker_2}")
         runtime = dia._ensure_runtime()
         
         base_config = GenerationConfig(
@@ -101,18 +138,12 @@ def _run_streaming_generation(
             use_cuda_graph=use_cuda_graph,
         )
         
-        overrides = {}
-        if prefix_speaker_1:
-            overrides["prefix_speaker_1"] = prefix_speaker_1
-        if prefix_speaker_2:
-            overrides["prefix_speaker_2"] = prefix_speaker_2
-        if include_prefix:
-            overrides["include_prefix"] = include_prefix
-            
-        merged = merge_generation_config(base=base_config, overrides=overrides)
+        # Get cached prefix plan
+        prefix_plan = None
+        if prefix_speaker_1 or prefix_speaker_2:
+            prefix_plan = _build_and_cache_prefix(runtime, prefix_speaker_1, prefix_speaker_2)
         
         normalized_text = normalize_script(text)
-        prefix_plan = build_prefix_plan(runtime, merged.prefix)
         
         entries = []
         if prefix_plan is not None:
@@ -124,7 +155,7 @@ def _run_streaming_generation(
             runtime.frame_rate
         ))
         
-        runtime.machine.initial_padding = merged.initial_padding
+        runtime.machine.initial_padding = base_config.initial_padding
         state = runtime.machine.new_state(entries)
         gen_state = build_initial_state(runtime, prefix=prefix_plan)
         
@@ -133,15 +164,14 @@ def _run_streaming_generation(
             start_step = warmup_with_prefix(runtime, prefix_plan, state, gen_state)
             print(f"[Dia2] Prefix warmup done, start_step={start_step}")
         
-        # Determine if we should include prefix audio in output
-        include_prefix_audio = bool(prefix_plan and merged.prefix and merged.prefix.include_audio)
+        include_prefix_audio = include_prefix
         
         chunk_count = 0
         for chunk in run_streaming_generation(
             runtime,
             state=state,
             generation=gen_state,
-            config=merged,
+            config=base_config,
             start_step=start_step,
             chunk_frames=chunk_frames,
             include_prefix_audio=include_prefix_audio,
@@ -168,31 +198,27 @@ def _run_streaming_generation(
 
 @app.websocket("/ws/stream_tts")
 async def stream_tts(ws: WebSocket):
-    """WebSocket endpoint with persistent connection support.
-    
-    Protocol:
-    1. Client connects
-    2. Server sends: {"event": "ready", "sample_rate": 24000}
-    3. Client can send:
-       - {"type": "set_voice", "speaker_1": "<base64>", "speaker_2": "<base64>"}
-         Server responds: {"event": "voice_set"}
-         Note: Only updates voices that are provided. Use "clear": true to reset all.
-       - {"type": "tts", "text": "[S1] Hello..."}
-         Server streams audio chunks, then {"event": "done"}
-       - {"type": "close"}
-         Server closes connection
-    4. Connection stays open for multiple requests
-    """
+    """WebSocket endpoint with persistent connection support."""
     await ws.accept()
     print("[Dia2] WebSocket connected")
     
     # Session state
     prefix_speaker_1: Optional[str] = None
     prefix_speaker_2: Optional[str] = None
-    temp_files: List[str] = []  # Track temp files for cleanup
+    temp_files: List[str] = []
+    
+    # Keepalive task
+    async def keepalive():
+        try:
+            while True:
+                await asyncio.sleep(30)
+                await ws.send_text(json.dumps({"event": "ping"}))
+        except:
+            pass
+    
+    keepalive_task = asyncio.create_task(keepalive())
     
     try:
-        # Send ready message
         await ws.send_text(json.dumps({
             "event": "ready",
             "sample_rate": dia.sample_rate,
@@ -200,8 +226,13 @@ async def stream_tts(ws: WebSocket):
         
         while True:
             try:
-                msg = await ws.receive_text()
+                msg = await asyncio.wait_for(ws.receive_text(), timeout=120)
+            except asyncio.TimeoutError:
+                print("[Dia2] Connection timeout, sending ping")
+                await ws.send_text(json.dumps({"event": "ping"}))
+                continue
             except WebSocketDisconnect:
+                print("[Dia2] Client disconnected")
                 break
                 
             try:
@@ -210,11 +241,14 @@ async def stream_tts(ws: WebSocket):
                 await ws.send_text(json.dumps({"error": "Invalid JSON"}))
                 continue
             
-            msg_type = payload.get("type", "tts")  # Default to tts for backwards compat
+            msg_type = payload.get("type", "tts")
+            
+            # Handle pong
+            if msg_type == "pong":
+                continue
             
             # Handle set_voice command
             if msg_type == "set_voice":
-                # Only clear if explicitly requested
                 if payload.get("clear"):
                     for f in temp_files:
                         try:
@@ -224,11 +258,10 @@ async def stream_tts(ws: WebSocket):
                     temp_files = []
                     prefix_speaker_1 = None
                     prefix_speaker_2 = None
+                    # Clear cache for this session's voices
                     print("[Dia2] Cleared all voices")
                 
-                # Update speaker 1 if provided
                 if payload.get("speaker_1"):
-                    # Remove old speaker 1 temp file if exists
                     if prefix_speaker_1 and prefix_speaker_1 in temp_files:
                         try:
                             os.unlink(prefix_speaker_1)
@@ -244,9 +277,7 @@ async def stream_tts(ws: WebSocket):
                     temp_files.append(path)
                     print(f"[Dia2] Set speaker 1 voice: {path}")
                 
-                # Update speaker 2 if provided
                 if payload.get("speaker_2"):
-                    # Remove old speaker 2 temp file if exists
                     if prefix_speaker_2 and prefix_speaker_2 in temp_files:
                         try:
                             os.unlink(prefix_speaker_2)
@@ -262,7 +293,6 @@ async def stream_tts(ws: WebSocket):
                     temp_files.append(path)
                     print(f"[Dia2] Set speaker 2 voice: {path}")
                 
-                # Report current state
                 await ws.send_text(json.dumps({
                     "event": "voice_set",
                     "speaker_1": prefix_speaker_1 is not None,
@@ -270,7 +300,6 @@ async def stream_tts(ws: WebSocket):
                 }))
                 continue
             
-            # Handle close command
             if msg_type == "close":
                 break
             
@@ -281,7 +310,6 @@ async def stream_tts(ws: WebSocket):
                     await ws.send_text(json.dumps({"error": "Missing 'text'"}))
                     continue
                 
-                # Create queue for streaming
                 chunk_queue: Queue = Queue()
                 
                 loop = asyncio.get_running_loop()
@@ -300,7 +328,6 @@ async def stream_tts(ws: WebSocket):
                     )
                 )
                 
-                # Stream chunks
                 chunks_sent = 0
                 while True:
                     try:
@@ -337,7 +364,6 @@ async def stream_tts(ws: WebSocket):
                 print(f"[Dia2] Sent {chunks_sent} chunks")
                 continue
             
-            # Unknown message type
             await ws.send_text(json.dumps({"error": f"Unknown type: {msg_type}"}))
     
     except WebSocketDisconnect:
@@ -347,7 +373,7 @@ async def stream_tts(ws: WebSocket):
         import traceback
         traceback.print_exc()
     finally:
-        # Cleanup temp files
+        keepalive_task.cancel()
         for f in temp_files:
             try:
                 os.unlink(f)
