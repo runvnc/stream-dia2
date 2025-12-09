@@ -44,14 +44,22 @@ class Dia2Client:
         """Connect to the server."""
         self.ws = await websockets.connect(self.ws_url, max_size=WS_MAX_SIZE)
         
-        # Wait for ready message
-        msg = await self.ws.recv()
-        data = json.loads(msg)
-        if data.get("event") == "ready":
-            self.sample_rate = data.get("sample_rate", 24000)
-            print(f"[client] Connected, sample_rate={self.sample_rate}")
-        else:
-            raise RuntimeError(f"Unexpected response: {data}")
+        # Wait for ready message, handling any pings that arrive first
+        while True:
+            msg = await self.ws.recv()
+            data = json.loads(msg)
+            event = data.get("event")
+            
+            if event == "ready":
+                self.sample_rate = data.get("sample_rate", 24000)
+                print(f"[client] Connected, sample_rate={self.sample_rate}")
+                break
+            elif event == "ping":
+                # Respond to ping and keep waiting for ready
+                await self.ws.send(json.dumps({"type": "pong"}))
+                continue
+            else:
+                raise RuntimeError(f"Unexpected response while connecting: {data}")
     
     async def set_voice(
         self,
@@ -78,13 +86,23 @@ class Dia2Client:
         
         await self.ws.send(json.dumps(payload))
         
-        # Wait for confirmation
-        msg = await self.ws.recv()
-        data = json.loads(msg)
-        if data.get("event") == "voice_set":
-            print("[client] Voice set successfully")
-        else:
-            print(f"[client] Unexpected response: {data}")
+        # Wait for confirmation, handling pings
+        while True:
+            msg = await self.ws.recv()
+            data = json.loads(msg)
+            event = data.get("event")
+            
+            if event == "voice_set":
+                print(f"[client] Voice set: speaker_1={data.get('speaker_1')}, speaker_2={data.get('speaker_2')}")
+                break
+            elif event == "ping":
+                await self.ws.send(json.dumps({"type": "pong"}))
+                continue
+            elif "error" in data:
+                print(f"[client] Error setting voice: {data['error']}")
+                break
+            else:
+                print(f"[client] Unexpected response: {data}")
     
     async def speak(self, text: str, include_prefix: bool = False) -> None:
         """Generate and play TTS for the given text."""
@@ -107,21 +125,32 @@ class Dia2Client:
         )
         self.stream.start()
         
+        chunks_received = 0
+        
         try:
             while True:
                 msg = await self.ws.recv()
                 
                 if isinstance(msg, str):
                     data = json.loads(msg)
-                    if data.get("event") == "done":
-                        print(f"[client] Done, received {data.get('chunks', '?')} chunks")
+                    event = data.get("event")
+                    
+                    if event == "done":
+                        print(f"[client] Done, received {chunks_received} chunks (server reported {data.get('chunks', '?')})")
                         break
+                    elif event == "ping":
+                        # Respond to ping during streaming
+                        await self.ws.send(json.dumps({"type": "pong"}))
+                        continue
                     elif "error" in data:
                         print(f"[client] Error: {data['error']}")
                         break
-                    continue
+                    else:
+                        # Unknown text message, ignore and continue
+                        print(f"[client] Ignoring message: {data}")
+                        continue
                 
-                # Binary frame
+                # Binary frame - audio data
                 if len(msg) < 1:
                     continue
                 
@@ -131,9 +160,10 @@ class Dia2Client:
                 
                 if audio.size > 0:
                     self.stream.write(audio)
+                    chunks_received += 1
                 
-                if is_last:
-                    break
+                # NOTE: Do NOT break on is_last! Wait for the "done" event.
+                # Breaking here causes message desync on subsequent requests.
         finally:
             if self.stream:
                 # Give time for audio to finish playing
@@ -173,6 +203,7 @@ async def interactive_mode(
     print("\nCommands:")
     print("  /voice <path>     - Set speaker 1 voice")
     print("  /voice2 <path>    - Set speaker 2 voice")
+    print("  /voices <p1> <p2> - Set both voices at once")
     print("  /s2 <text>        - Speak as Speaker 2")
     print("  /both <s1> | <s2> - Dialogue")
     print("  /quit             - Exit")
@@ -193,6 +224,14 @@ async def interactive_mode(
             # Commands
             if user_input.lower() in ("/quit", "/q", "quit", "exit"):
                 break
+            
+            if user_input.lower().startswith("/voices "):
+                parts = user_input[8:].strip().split()
+                if len(parts) >= 2:
+                    await client.set_voice(speaker_1_path=parts[0], speaker_2_path=parts[1])
+                else:
+                    print("  Usage: /voices <speaker1_path> <speaker2_path>")
+                continue
             
             if user_input.lower().startswith("/voice2 "):
                 path = user_input[8:].strip()
@@ -221,6 +260,8 @@ async def interactive_mode(
                 await client.speak(text)
             except Exception as e:
                 print(f"  [error] {e}")
+                import traceback
+                traceback.print_exc()
     
     finally:
         await client.close()

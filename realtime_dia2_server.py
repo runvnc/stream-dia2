@@ -18,7 +18,10 @@ import numpy as np
 import torch
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
+# Import dia2 components
 from dia2 import Dia2, GenerationConfig, SamplingConfig
+from dia2.runtime import voice_clone
+from dia2.runtime.voice_clone import WhisperWord
 
 
 app = FastAPI()
@@ -27,6 +30,77 @@ MODEL_REPO = "nari-labs/Dia2-2B"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = "bfloat16"
 
+# ============================================================================
+# Whisper Model Caching - Load once, use forever
+# ============================================================================
+
+_whisper_model = None
+_transcription_cache: Dict[str, List[WhisperWord]] = {}
+
+
+def _get_whisper_model():
+    """Get or load the cached Whisper model."""
+    global _whisper_model
+    if _whisper_model is None:
+        import whisper_timestamped as wts
+        print("[Dia2] Loading Whisper model (one-time)...")
+        _whisper_model = wts.load_model("openai/whisper-large-v3", device=DEVICE)
+        print("[Dia2] Whisper model loaded.")
+    return _whisper_model
+
+
+def _hash_file(path: str) -> str:
+    """Compute SHA256 hash of a file."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _cached_transcribe_words(
+    audio_path: str,
+    device: torch.device,
+    language: Optional[str] = None,
+) -> List[WhisperWord]:
+    """Cached version of transcribe_words that reuses the Whisper model."""
+    file_hash = _hash_file(audio_path)
+    
+    if file_hash in _transcription_cache:
+        print(f"[Dia2] Using cached transcription for {os.path.basename(audio_path)}")
+        return _transcription_cache[file_hash]
+    
+    print(f"[Dia2] Transcribing {os.path.basename(audio_path)}...")
+    import whisper_timestamped as wts
+    model = _get_whisper_model()
+    result = wts.transcribe(model, audio_path, language=language)
+    
+    words: List[WhisperWord] = []
+    for segment in result.get("segments", []):
+        for word in segment.get("words", []):
+            text = (word.get("text") or word.get("word") or "").strip()
+            if not text:
+                continue
+            words.append(WhisperWord(
+                text=text,
+                start=float(word.get("start", 0.0)),
+                end=float(word.get("end", 0.0)),
+            ))
+    
+    _transcription_cache[file_hash] = words
+    print(f"[Dia2] Transcription cached ({len(words)} words)")
+    return words
+
+
+# Monkey-patch the voice_clone module to use our cached version
+print("[Dia2] Patching voice_clone.transcribe_words with cached version...")
+voice_clone.transcribe_words = _cached_transcribe_words
+
+
+# ============================================================================
+# Dia2 Model Initialization
+# ============================================================================
+
 print(f"[Dia2] Initializing Dia2 from {MODEL_REPO} on {DEVICE} ({DTYPE})...")
 dia = Dia2.from_repo(MODEL_REPO, device=DEVICE, dtype=DTYPE)
 
@@ -34,6 +108,7 @@ _cuda_executor = ThreadPoolExecutor(max_workers=1)
 
 
 def _warmup_model() -> None:
+    """Warm up the model with a simple generation."""
     try:
         cfg = GenerationConfig(
             cfg_scale=2.0,
@@ -50,6 +125,10 @@ def _warmup_model() -> None:
 
 _cuda_executor.submit(_warmup_model).result()
 
+
+# ============================================================================
+# Audio Processing
+# ============================================================================
 
 @dataclass
 class AudioChunk:
@@ -99,6 +178,10 @@ def save_audio_from_base64(audio_b64: str, suffix: str = ".wav") -> str:
     return path
 
 
+# ============================================================================
+# TTS Generation
+# ============================================================================
+
 def _generate_tts(
     text: str,
     prefix_speaker_1: Optional[str] = None,
@@ -133,6 +216,10 @@ def _generate_tts(
     return chunks
 
 
+# ============================================================================
+# WebSocket Endpoint
+# ============================================================================
+
 @app.websocket("/ws/stream_tts")
 async def stream_tts(ws: WebSocket):
     """WebSocket endpoint with persistent connection.
@@ -152,13 +239,16 @@ async def stream_tts(ws: WebSocket):
     prefix_speaker_2: Optional[str] = None
     temp_files: List[str] = []
     
-    # Keepalive
+    # Keepalive task
     async def keepalive():
         try:
             while True:
-                await asyncio.sleep(15)
-                await ws.send_text(json.dumps({"event": "ping"}))
-        except:
+                await asyncio.sleep(30)  # Increased from 15 to 30 seconds
+                try:
+                    await ws.send_text(json.dumps({"event": "ping"}))
+                except:
+                    break
+        except asyncio.CancelledError:
             pass
     
     keepalive_task = asyncio.create_task(keepalive())
@@ -172,9 +262,6 @@ async def stream_tts(ws: WebSocket):
         while True:
             try:
                 msg = await ws.receive_text()
-            except asyncio.TimeoutError:
-                await ws.send_text(json.dumps({"event": "ping"}))
-                continue
             except WebSocketDisconnect:
                 break
             
@@ -201,7 +288,7 @@ async def stream_tts(ws: WebSocket):
                     prefix_speaker_2 = None
                 
                 if payload.get("speaker_1"):
-                    if prefix_speaker_1 in temp_files:
+                    if prefix_speaker_1 and prefix_speaker_1 in temp_files:
                         try:
                             os.unlink(prefix_speaker_1)
                             temp_files.remove(prefix_speaker_1)
@@ -215,7 +302,7 @@ async def stream_tts(ws: WebSocket):
                     print(f"[Dia2] Set speaker 1: {prefix_speaker_1}")
                 
                 if payload.get("speaker_2"):
-                    if prefix_speaker_2 in temp_files:
+                    if prefix_speaker_2 and prefix_speaker_2 in temp_files:
                         try:
                             os.unlink(prefix_speaker_2)
                             temp_files.remove(prefix_speaker_2)
@@ -260,6 +347,8 @@ async def stream_tts(ws: WebSocket):
                     )
                 except Exception as e:
                     print(f"[Dia2] Generation error: {e}")
+                    import traceback
+                    traceback.print_exc()
                     await ws.send_text(json.dumps({"error": str(e)}))
                     continue
                 
@@ -275,7 +364,7 @@ async def stream_tts(ws: WebSocket):
             await ws.send_text(json.dumps({"error": f"Unknown type: {msg_type}"}))
     
     except WebSocketDisconnect:
-        print("[Dia2] Disconnected")
+        print("[Dia2] Client disconnected")
     except Exception as e:
         print(f"[Dia2] Error: {e}")
         import traceback
@@ -287,4 +376,4 @@ async def stream_tts(ws: WebSocket):
                 os.unlink(f)
             except:
                 pass
-        print("[Dia2] Cleaned up")
+        print("[Dia2] Connection cleaned up")
