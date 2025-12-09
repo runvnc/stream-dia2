@@ -60,23 +60,13 @@ def run_streaming_generation(
 ) -> Iterator[StreamingChunk]:
     """
     Streaming generation loop that yields audio chunks as they're generated.
-    
-    Args:
-        runtime: The runtime context
-        state: The state machine state
-        generation: The generation state
-        config: Generation configuration
-        start_step: Starting step (for prefix warmup)
-        chunk_frames: Number of frames per chunk (default 25 = ~2 sec)
-        logger: Optional logger
-        
-    Yields:
-        StreamingChunk objects containing decoded audio
     """
     step_tokens = generation.step_tokens
     audio_buf = generation.audio_buf
     branches = step_tokens.shape[0]
     max_context = runtime.config.runtime.max_context_steps
+    
+    print(f"[streaming] max_context={max_context}, audio_buf.shape={audio_buf.shape}, start_step={start_step}")
     
     if max_context <= 0:
         raise ValueError("Runtime configuration must specify a positive max_context_steps")
@@ -91,11 +81,14 @@ def run_streaming_generation(
     max_delay = int(delay_tensor.max().item()) if delay_tensor.numel() else 0
     flush_tail = max_delay + getattr(runtime.machine, "max_padding", 0)
     
+    print(f"[streaming] max_delay={max_delay}, flush_tail={flush_tail}, cfg_active={cfg_active}")
+    
     first_word_frame: Optional[int] = None
     eos_cutoff: Optional[int] = None
     last_step = start_step - 1
     
     use_graph = config.use_cuda_graph and runtime.device.type == "cuda"
+    print(f"[streaming] use_cuda_graph={config.use_cuda_graph}, device={runtime.device.type}, use_graph={use_graph}")
     
     sample_token_fn = sample_token
     sample_audio_logits_fn = sample_audio_logits
@@ -115,13 +108,22 @@ def run_streaming_generation(
     last_decoded_frame = start_step
     sample_rate = runtime.mimi.sample_rate
     
+    print(f"[streaming] Starting generation loop...")
+    steps_completed = 0
+    
     with torch.inference_mode():
         for offset in range(max_context):
             t = start_step + offset
             
+            # Debug first few iterations
+            if offset < 3:
+                print(f"[streaming] offset={offset}, t={t}, eos_cutoff={eos_cutoff}, state.end_step={state.end_step}")
+            
             if eos_cutoff is not None and t >= eos_cutoff:
+                print(f"[streaming] Breaking: t={t} >= eos_cutoff={eos_cutoff}")
                 break
             if t + 1 >= audio_buf.shape[-1]:
+                print(f"[streaming] Breaking: t+1={t+1} >= audio_buf.shape[-1]={audio_buf.shape[-1]}")
                 break
             
             generation.reset_dep_cache()
@@ -229,9 +231,11 @@ def run_streaming_generation(
                 prev_audio = stage_token.expand(branches)
             
             last_step = t
+            steps_completed += 1
             
             if eos_cutoff is None and state.end_step is not None:
                 eos_cutoff = state.end_step + flush_tail
+                print(f"[streaming] EOS detected at step {state.end_step}, eos_cutoff set to {eos_cutoff}")
             
             # Check if we should yield a chunk
             frames_since_decode = (t + 1) - last_decoded_frame
@@ -241,6 +245,8 @@ def run_streaming_generation(
                 # Extract and decode the new frames
                 chunk_end = t + 2  # +2 because we just wrote to t+1
                 chunk_start = last_decoded_frame
+                
+                print(f"[streaming] Yielding chunk: frames {chunk_start}-{chunk_end}, is_final={is_final}")
                 
                 # Get the audio tokens for this chunk
                 chunk_tokens = audio_buf[0:1, :, chunk_start:chunk_end].clone()
@@ -254,6 +260,7 @@ def run_streaming_generation(
                 
                 if aligned.shape[-1] > 0:
                     waveform = decode_audio_chunk(runtime, aligned)
+                    print(f"[streaming] Decoded waveform: {waveform.shape}")
                     
                     yield StreamingChunk(
                         waveform=waveform,
@@ -262,11 +269,15 @@ def run_streaming_generation(
                         frame_end=chunk_end,
                         is_final=is_final,
                     )
+                else:
+                    print(f"[streaming] Skipping chunk: aligned.shape[-1] = 0")
                 
                 last_decoded_frame = chunk_end
                 
                 if is_final:
                     break
+    
+    print(f"[streaming] Loop finished, steps_completed={steps_completed}")
 
 
 __all__ = [
