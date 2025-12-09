@@ -116,6 +116,7 @@ def _cached_load_audio(audio_path: str, sample_rate: int) -> np.ndarray:
     file_hash = _hash_file(audio_path)
     
     # Store path for the encode function to use
+    print(f"[Dia2] DEBUG _cached_load_audio: path={os.path.basename(audio_path)}, hash={file_hash[:16]}...")
     _current_encoding_path = audio_path
     
     if file_hash in _audio_data_cache:
@@ -137,6 +138,7 @@ def _cached_encode_audio(mimi, audio: np.ndarray) -> torch.Tensor:
     global _current_encoding_path
     
     if _current_encoding_path:
+        print(f"[Dia2] DEBUG _cached_encode_audio: current_path={os.path.basename(_current_encoding_path)}")
         file_hash = _hash_file(_current_encoding_path)
         if file_hash in _audio_token_cache:
             print(f"[Dia2] Using cached audio tokens")
@@ -150,6 +152,7 @@ def _cached_encode_audio(mimi, audio: np.ndarray) -> torch.Tensor:
     
     if _current_encoding_path:
         file_hash = _hash_file(_current_encoding_path)
+        print(f"[Dia2] DEBUG: Caching audio tokens with hash={file_hash[:16]}..., shape={tokens.shape}")
         _audio_token_cache[file_hash] = tokens
     
     return tokens
@@ -206,6 +209,28 @@ def _cached_build_prefix_plan(runtime, prefix: Optional[PrefixConfig], **kwargs)
         if s2_start:
             for i, entry in enumerate(result.entries[s2_start:s2_start+3]):
                 print(f"[Dia2] DEBUG:   S2 Entry {s2_start+i}: tokens={entry.tokens[:5]}... text='{entry.text}'")
+    
+    # Debug: Check audio token shapes
+    if result:
+        print(f"[Dia2] DEBUG: aligned_tokens shape={result.aligned_tokens.shape}")
+        # Show first few values of audio tokens to verify they're different
+        if result.aligned_tokens.shape[1] > 0:
+            s1_sample = result.aligned_tokens[0, :3].tolist() if result.aligned_tokens.shape[1] >= 3 else result.aligned_tokens[0, :].tolist()
+            print(f"[Dia2] DEBUG: S1 audio tokens (first 3 frames, ch0): {s1_sample}")
+        if result.aligned_tokens.shape[1] > 200:  # S2 starts after S1
+            s2_sample = result.aligned_tokens[0, -3:].tolist()
+            print(f"[Dia2] DEBUG: S2 audio tokens (last 3 frames, ch0): {s2_sample}")
+    
+    # Debug: Check new_word_steps
+    if result:
+        print(f"[Dia2] DEBUG: new_word_steps count={len(result.new_word_steps)}")
+        if result.new_word_steps:
+            # Show first few (S1) and last few (S2) word steps
+            s1_steps = result.new_word_steps[:3]
+            s2_steps = result.new_word_steps[-3:] if len(result.new_word_steps) > 3 else []
+            print(f"[Dia2] DEBUG: S1 word steps (first 3): {s1_steps}")
+            print(f"[Dia2] DEBUG: S2 word steps (last 3): {s2_steps}")
+            print(f"[Dia2] DEBUG: aligned_frames={result.aligned_frames}, so S2 steps should be > ~{result.aligned_frames // 2}")
     
     return result
 
@@ -414,7 +439,7 @@ async def stream_tts(ws: WebSocket):
     async def keepalive():
         try:
             while True:
-                await asyncio.sleep(30)  # Increased from 15 to 30 seconds
+                await asyncio.sleep(10)  # More aggressive for RunPod proxy
                 try:
                     await ws.send_text(json.dumps({"event": "ping"}))
                 except:
