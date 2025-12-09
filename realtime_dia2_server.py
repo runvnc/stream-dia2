@@ -1,7 +1,8 @@
 """Dia2 TTS Server with persistent WebSocket connections and voice conditioning.
 
 This version uses the standard dia2.generate() for reliability, then streams
-the result in chunks. Voice samples are cached to avoid re-transcription.
+the result in chunks. Voice samples are cached to avoid re-transcription
+and re-encoding.
 """
 import asyncio
 import base64
@@ -12,6 +13,7 @@ import os
 import hashlib
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+import time
 from typing import Optional, List, Dict, Any
 
 import numpy as np
@@ -21,6 +23,9 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 # Import dia2 components
 from dia2 import Dia2, GenerationConfig, SamplingConfig
 from dia2.runtime import voice_clone
+from dia2.runtime.voice_clone import WhisperWord, build_prefix_plan, PrefixPlan
+from dia2.runtime.audio_io import load_mono_audio, encode_audio_tokens
+from dia2.generation import PrefixConfig
 from dia2.runtime.voice_clone import WhisperWord
 
 
@@ -35,6 +40,13 @@ DTYPE = "bfloat16"
 # ============================================================================
 
 _whisper_model = None
+_audio_token_cache: Dict[str, torch.Tensor] = {}  # hash -> encoded audio tokens
+_prefix_plan_cache: Dict[str, PrefixPlan] = {}  # hash -> full prefix plan
+_audio_data_cache: Dict[str, np.ndarray] = {}  # hash -> loaded audio numpy array
+
+# Track file path during encoding for caching
+_current_encoding_path: Optional[str] = None
+
 _transcription_cache: Dict[str, List[WhisperWord]] = {}
 
 
@@ -97,12 +109,119 @@ print("[Dia2] Patching voice_clone.transcribe_words with cached version...")
 voice_clone.transcribe_words = _cached_transcribe_words
 
 
+def _cached_load_audio(audio_path: str, sample_rate: int) -> np.ndarray:
+    """Load audio with caching."""
+    global _current_encoding_path
+    file_hash = _hash_file(audio_path)
+    
+    # Store path for the encode function to use
+    _current_encoding_path = audio_path
+    
+    if file_hash in _audio_data_cache:
+        print(f"[Dia2] Using cached audio data for {os.path.basename(audio_path)}")
+        return _audio_data_cache[file_hash]
+    
+    print(f"[Dia2] Loading audio {os.path.basename(audio_path)}...")
+    t0 = time.perf_counter()
+    audio = load_mono_audio(audio_path, sample_rate)
+    elapsed = time.perf_counter() - t0
+    print(f"[Dia2] Audio loaded in {elapsed:.2f}s")
+    
+    _audio_data_cache[file_hash] = audio
+    return audio
+
+
+def _cached_encode_audio(mimi, audio: np.ndarray) -> torch.Tensor:
+    """Encode audio with caching based on current path."""
+    global _current_encoding_path
+    
+    if _current_encoding_path:
+        file_hash = _hash_file(_current_encoding_path)
+        if file_hash in _audio_token_cache:
+            print(f"[Dia2] Using cached audio tokens")
+            return _audio_token_cache[file_hash]
+    
+    print(f"[Dia2] Encoding audio...")
+    t0 = time.perf_counter()
+    tokens = encode_audio_tokens(mimi, audio)
+    elapsed = time.perf_counter() - t0
+    print(f"[Dia2] Audio encoded in {elapsed:.2f}s, shape={tokens.shape}")
+    
+    if _current_encoding_path:
+        file_hash = _hash_file(_current_encoding_path)
+        _audio_token_cache[file_hash] = tokens
+    
+    return tokens
+
+
+# Store original build_prefix_plan
+_original_build_prefix_plan = build_prefix_plan
+
+def _cached_build_prefix_plan(runtime, prefix: Optional[PrefixConfig], **kwargs):
+    """Wrapper around build_prefix_plan that injects cached functions."""
+    if prefix is None:
+        return None
+    
+    # Create encode function that uses our cache
+    def cached_encode_fn(audio: np.ndarray) -> torch.Tensor:
+        return _cached_encode_audio(runtime.mimi, audio)
+    
+    return _original_build_prefix_plan(
+        runtime,
+        prefix,
+        transcribe_fn=_cached_transcribe_words,
+        load_audio_fn=_cached_load_audio,
+        encode_fn=cached_encode_fn,
+        **kwargs
+    )
+
+# Monkey-patch build_prefix_plan
+print("[Dia2] Patching voice_clone.build_prefix_plan with cached version...")
+voice_clone.build_prefix_plan = _cached_build_prefix_plan
+
+
+def _preload_voice(audio_path: str) -> None:
+    """Pre-transcribe AND pre-encode audio file to warm all caches.
+    
+    Call this when voice is set, not when generation starts.
+    """
+    global _current_encoding_path
+    try:
+        t0 = time.perf_counter()
+        
+        # Pre-transcribe (uses Whisper)
+        _cached_transcribe_words(audio_path, torch.device(DEVICE))
+        t1 = time.perf_counter()
+        print(f"[Dia2] Transcription took {t1-t0:.2f}s")
+        
+        # Pre-load and encode audio tokens (uses Mimi)
+        runtime = dia._ensure_runtime()
+        
+        # Load audio (caches it)
+        audio = _cached_load_audio(audio_path, runtime.mimi.sample_rate)
+        
+        # Encode audio (caches it)
+        _cached_encode_audio(runtime.mimi, audio)
+        t2 = time.perf_counter()
+        print(f"[Dia2] Audio encoding took {t2-t1:.2f}s")
+        
+        print(f"[Dia2] Total preload time: {t2-t0:.2f}s")
+    except Exception as e:
+        print(f"[Dia2] Warning: Failed to preload {audio_path}: {e}")
+        import traceback
+        traceback.print_exc()
+
+
 # ============================================================================
 # Dia2 Model Initialization
 # ============================================================================
 
 print(f"[Dia2] Initializing Dia2 from {MODEL_REPO} on {DEVICE} ({DTYPE})...")
 dia = Dia2.from_repo(MODEL_REPO, device=DEVICE, dtype=DTYPE)
+
+# Also preload Whisper model at startup
+print("[Dia2] Pre-loading Whisper model...")
+_get_whisper_model()
 
 _cuda_executor = ThreadPoolExecutor(max_workers=1)
 
@@ -188,19 +307,22 @@ def _generate_tts(
     prefix_speaker_2: Optional[str] = None,
     include_prefix: bool = False,
     cfg_scale: float = 6.0,
-    temperature: float = 0.8,
+    text_temperature: float = 0.6,
+    audio_temperature: float = 0.8,
     top_k: int = 50,
 ) -> List[AudioChunk]:
     """Generate TTS using dia2.generate() and return chunks."""
-    print(f"[Dia2] Generating: {text[:50]}...")
+    t_start = time.perf_counter()
+    print(f"[Dia2] Generating: {text[:80]}...")
     
     cfg = GenerationConfig(
         cfg_scale=cfg_scale,
-        text=SamplingConfig(temperature=temperature, top_k=top_k),
-        audio=SamplingConfig(temperature=temperature, top_k=top_k),
+        text=SamplingConfig(temperature=text_temperature, top_k=top_k),
+        audio=SamplingConfig(temperature=audio_temperature, top_k=top_k),
         use_cuda_graph=True,
     )
     
+    t_before_gen = time.perf_counter()
     result = dia.generate(
         text,
         config=cfg,
@@ -210,9 +332,15 @@ def _generate_tts(
         include_prefix=include_prefix,
         verbose=False,
     )
+    t_after_gen = time.perf_counter()
     
     chunks = waveform_to_pcm16_chunks(result.waveform, result.sample_rate, chunk_ms=100)
-    print(f"[Dia2] Generated {len(chunks)} chunks")
+    t_end = time.perf_counter()
+    
+    print(f"[Dia2] Timing: setup={t_before_gen-t_start:.2f}s, "
+          f"generate={t_after_gen-t_before_gen:.2f}s, "
+          f"chunk={t_end-t_after_gen:.2f}s, total={t_end-t_start:.2f}s")
+    print(f"[Dia2] Generated {len(chunks)} chunks ({result.waveform.shape[-1]/result.sample_rate:.2f}s audio)")
     return chunks
 
 
@@ -300,6 +428,9 @@ async def stream_tts(ws: WebSocket):
                     prefix_speaker_1 = save_audio_from_base64(payload["speaker_1"], suffix)
                     temp_files.append(prefix_speaker_1)
                     print(f"[Dia2] Set speaker 1: {prefix_speaker_1}")
+                    # Pre-transcribe immediately in background
+                    loop = asyncio.get_running_loop()
+                    loop.run_in_executor(_cuda_executor, _preload_voice, prefix_speaker_1)
                 
                 if payload.get("speaker_2"):
                     if prefix_speaker_2 and prefix_speaker_2 in temp_files:
@@ -314,6 +445,9 @@ async def stream_tts(ws: WebSocket):
                     prefix_speaker_2 = save_audio_from_base64(payload["speaker_2"], suffix)
                     temp_files.append(prefix_speaker_2)
                     print(f"[Dia2] Set speaker 2: {prefix_speaker_2}")
+                    # Pre-transcribe immediately in background
+                    loop = asyncio.get_running_loop()
+                    loop.run_in_executor(_cuda_executor, _preload_voice, prefix_speaker_2)
                 
                 await ws.send_text(json.dumps({
                     "event": "voice_set",
@@ -341,7 +475,8 @@ async def stream_tts(ws: WebSocket):
                             prefix_speaker_2=prefix_speaker_2,
                             include_prefix=bool(payload.get("include_prefix", False)),
                             cfg_scale=float(payload.get("cfg_scale", 6.0)),
-                            temperature=float(payload.get("temperature", 0.8)),
+                            text_temperature=float(payload.get("text_temperature", 0.6)),
+                            audio_temperature=float(payload.get("audio_temperature", 0.8)),
                             top_k=int(payload.get("top_k", 50)),
                         )
                     )
