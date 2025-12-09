@@ -1,7 +1,7 @@
 import asyncio
 import json
 import struct
-import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Optional, List
 
@@ -24,9 +24,11 @@ MODEL_REPO = "nari-labs/Dia2-2B"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = "bfloat16"  # or "auto" / "float32"
 
-
 print(f"[Dia2] Initializing Dia2 from {MODEL_REPO} on {DEVICE} ({DTYPE})...")
 dia = Dia2.from_repo(MODEL_REPO, device=DEVICE, dtype=DTYPE)
+
+# Single-thread executor to ensure all CUDA ops happen on the same thread
+_cuda_executor = ThreadPoolExecutor(max_workers=1)
 
 
 def _warmup_model() -> None:
@@ -41,11 +43,12 @@ def _warmup_model() -> None:
         print("[Dia2] Running warm-up generation...")
         _ = dia.generate("[S1] Warm up.", config=cfg, output_wav=None, verbose=False)
         print("[Dia2] Warm-up complete.")
-    except Exception as e:  # pragma: no cover
+    except Exception as e:
         print(f"[Dia2] Warm-up failed: {e}")
 
 
-_warmup_model()
+# Run warmup in the executor thread so CUDA is initialized there
+_cuda_executor.submit(_warmup_model).result()
 
 
 # -------------------------------
@@ -64,21 +67,15 @@ def waveform_to_chunks(
     sample_rate: int,
     chunk_ms: int = 80,
 ) -> List[AudioChunk]:
-    """Split a 1D float waveform into PCM16 chunks of ~chunk_ms.
-
-    - waveform: 1D torch tensor in [-1, 1]
-    - sample_rate: int
-    - chunk_ms: size of each chunk in milliseconds
-    """
+    """Split a 1D float waveform into PCM16 chunks of ~chunk_ms."""
     if waveform.ndim != 1:
         waveform = waveform.view(-1)
 
     num_samples = waveform.shape[0]
     samples_per_chunk = int(sample_rate * chunk_ms / 1000)
     if samples_per_chunk <= 0:
-        samples_per_chunk = max(sample_rate // 50, 1)  # fallback: ~20 ms
+        samples_per_chunk = max(sample_rate // 50, 1)
 
-    # Clamp and convert to 16-bit PCM
     wav_np = waveform.detach().cpu().numpy().astype(np.float32)
     wav_np = np.clip(wav_np, -1.0, 1.0)
     pcm16 = (wav_np * 32767.0).astype(np.int16)
@@ -102,70 +99,39 @@ def waveform_to_chunks(
     return chunks
 
 
-# -------------------------------------
-# Worker: blocking generate in a thread
-# -------------------------------------
+# -------------------------------
+# Generation function (runs in executor)
+# -------------------------------
 
-class GenerationWorker:
-    def __init__(
-        self,
-        text: str,
-        prefix_speaker_1: Optional[str] = None,
-        prefix_speaker_2: Optional[str] = None,
-        include_prefix: bool = False,
-        cfg_scale: float = 6.0,
-        temperature: float = 0.8,
-        top_k: int = 50,
-        use_cuda_graph: bool = True,
-    ) -> None:
-        self.text = text
-        self.prefix_speaker_1 = prefix_speaker_1
-        self.prefix_speaker_2 = prefix_speaker_2
-        self.include_prefix = include_prefix
-        self.cfg_scale = cfg_scale
-        self.temperature = temperature
-        self.top_k = top_k
-        self.use_cuda_graph = use_cuda_graph
+def _generate_audio(
+    text: str,
+    prefix_speaker_1: Optional[str] = None,
+    prefix_speaker_2: Optional[str] = None,
+    include_prefix: bool = False,
+    cfg_scale: float = 6.0,
+    temperature: float = 0.8,
+    top_k: int = 50,
+    use_cuda_graph: bool = True,
+) -> List[AudioChunk]:
+    """Generate audio and return chunks. Runs in the CUDA executor thread."""
+    cfg = GenerationConfig(
+        cfg_scale=cfg_scale,
+        text=SamplingConfig(temperature=temperature, top_k=top_k),
+        audio=SamplingConfig(temperature=temperature, top_k=top_k),
+        use_cuda_graph=use_cuda_graph,
+    )
 
-        self.queue: asyncio.Queue[Optional[AudioChunk]] = asyncio.Queue()
-        self.thread = threading.Thread(target=self._run, daemon=True)
+    result = dia.generate(
+        text,
+        config=cfg,
+        output_wav=None,
+        prefix_speaker_1=prefix_speaker_1,
+        prefix_speaker_2=prefix_speaker_2,
+        include_prefix=include_prefix,
+        verbose=False,
+    )
 
-    def start(self) -> None:
-        self.thread.start()
-
-    def _run(self) -> None:
-        """Blocking Dia2.generate, then push chunks into async queue."""
-        try:
-            base_cfg = GenerationConfig(
-                cfg_scale=self.cfg_scale,
-                text=SamplingConfig(temperature=self.temperature, top_k=self.top_k),
-                audio=SamplingConfig(temperature=self.temperature, top_k=self.top_k),
-                use_cuda_graph=self.use_cuda_graph,
-            )
-
-            result = dia.generate(
-                self.text,
-                config=base_cfg,
-                output_wav=None,
-                prefix_speaker_1=self.prefix_speaker_1,
-                prefix_speaker_2=self.prefix_speaker_2,
-                include_prefix=self.include_prefix,
-                verbose=False,
-            )
-
-            waveform = result.waveform
-            sr = result.sample_rate
-            chunks = waveform_to_chunks(waveform, sr, chunk_ms=80)
-            loop = asyncio.get_event_loop()
-            for ch in chunks:
-                loop.call_soon_threadsafe(self.queue.put_nowait, ch)
-        except Exception as e:  # pragma: no cover
-            loop = asyncio.get_event_loop()
-            loop.call_soon_threadsafe(self.queue.put_nowait, None)
-            print(f"[Dia2] Generation error: {e}")
-        finally:
-            loop = asyncio.get_event_loop()
-            loop.call_soon_threadsafe(self.queue.put_nowait, None)
+    return waveform_to_chunks(result.waveform, result.sample_rate, chunk_ms=80)
 
 
 # -------------------------------
@@ -178,43 +144,31 @@ async def tts_once(payload: dict):
     if not text:
         return JSONResponse({"error": "Missing 'text'"}, status_code=400)
 
-    prefix1 = payload.get("prefix_speaker_1")
-    prefix2 = payload.get("prefix_speaker_2")
-    include_prefix = bool(payload.get("include_prefix", False))
+    loop = asyncio.get_running_loop()
+    
+    try:
+        chunks = await loop.run_in_executor(
+            _cuda_executor,
+            lambda: _generate_audio(
+                text=text,
+                prefix_speaker_1=payload.get("prefix_speaker_1"),
+                prefix_speaker_2=payload.get("prefix_speaker_2"),
+                include_prefix=bool(payload.get("include_prefix", False)),
+                cfg_scale=float(payload.get("cfg_scale", 6.0)),
+                temperature=float(payload.get("temperature", 0.8)),
+                top_k=int(payload.get("top_k", 50)),
+            )
+        )
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
-    base_cfg = GenerationConfig(
-        cfg_scale=payload.get("cfg_scale", 6.0),
-        text=SamplingConfig(
-            temperature=payload.get("temperature", 0.8),
-            top_k=payload.get("top_k", 50),
-        ),
-        audio=SamplingConfig(
-            temperature=payload.get("temperature", 0.8),
-            top_k=payload.get("top_k", 50),
-        ),
-        use_cuda_graph=True,
-    )
-
-    result = dia.generate(
-        text,
-        config=base_cfg,
-        output_wav=None,
-        prefix_speaker_1=prefix1,
-        prefix_speaker_2=prefix2,
-        include_prefix=include_prefix,
-        verbose=False,
-    )
-
-    waveform = result.waveform
-    sr = result.sample_rate
-    wav_np = waveform.detach().cpu().numpy().astype(np.float32)
-    wav_np = np.clip(wav_np, -1.0, 1.0)
-    pcm16 = (wav_np * 32767.0).astype(np.int16)
+    # Combine all chunks
+    all_pcm = b"".join(ch.pcm16 for ch in chunks)
+    sample_rate = chunks[0].sample_rate if chunks else 44100
 
     return {
-        "sample_rate": sr,
-        "pcm16_hex": pcm16.tobytes().hex(),
-        "timestamps": result.timestamps,
+        "sample_rate": sample_rate,
+        "pcm16_hex": all_pcm.hex(),
     }
 
 
@@ -240,24 +194,32 @@ async def stream_tts(ws: WebSocket):
             await ws.close(code=1003)
             return
 
-        worker = GenerationWorker(
-            text=text,
-            prefix_speaker_1=payload.get("prefix_speaker_1"),
-            prefix_speaker_2=payload.get("prefix_speaker_2"),
-            include_prefix=bool(payload.get("include_prefix", False)),
-            cfg_scale=float(payload.get("cfg_scale", 6.0)),
-            temperature=float(payload.get("temperature", 0.8)),
-            top_k=int(payload.get("top_k", 50)),
-            use_cuda_graph=True,
-        )
-        worker.start()
-
+        # Send config first
         await ws.send_text(json.dumps({"event": "config", "sample_rate": dia.sample_rate}))
 
-        while True:
-            chunk = await worker.queue.get()
-            if chunk is None:
-                break
+        loop = asyncio.get_running_loop()
+        
+        try:
+            chunks = await loop.run_in_executor(
+                _cuda_executor,
+                lambda: _generate_audio(
+                    text=text,
+                    prefix_speaker_1=payload.get("prefix_speaker_1"),
+                    prefix_speaker_2=payload.get("prefix_speaker_2"),
+                    include_prefix=bool(payload.get("include_prefix", False)),
+                    cfg_scale=float(payload.get("cfg_scale", 6.0)),
+                    temperature=float(payload.get("temperature", 0.8)),
+                    top_k=int(payload.get("top_k", 50)),
+                )
+            )
+        except Exception as e:
+            print(f"[Dia2] Generation error: {e}")
+            await ws.send_text(json.dumps({"error": str(e)}))
+            await ws.close(code=1011)
+            return
+
+        # Stream chunks to client
+        for chunk in chunks:
             header = struct.pack("!?", chunk.is_last)
             await ws.send_bytes(header + chunk.pcm16)
 
@@ -265,7 +227,7 @@ async def stream_tts(ws: WebSocket):
 
     except WebSocketDisconnect:
         print("[Dia2] WebSocket disconnected")
-    except Exception as e:  # pragma: no cover
+    except Exception as e:
         print(f"[Dia2] WebSocket error: {e}")
         try:
             await ws.send_text(json.dumps({"error": str(e)}))
