@@ -32,7 +32,7 @@ class StreamingChunk:
     waveform: torch.Tensor  # 1D float tensor
     sample_rate: int
     frame_start: int  # Starting frame index
-    frame_end: int    # Ending frame index
+    frame_end: int    # Ending frame index  
     is_final: bool    # True if this is the last chunk
 
 
@@ -40,7 +40,7 @@ def decode_audio_chunk(
     runtime: RuntimeContext,
     tokens: torch.Tensor,
 ) -> torch.Tensor:
-    """Decode a chunk of audio tokens to waveform."""
+    """Decode audio tokens to waveform."""
     if tokens.shape[-1] == 0:
         return torch.zeros(0, device=runtime.device)
     with torch.inference_mode():
@@ -60,6 +60,9 @@ def run_streaming_generation(
 ) -> Iterator[StreamingChunk]:
     """
     Streaming generation loop that yields audio chunks as they're generated.
+    
+    To handle the audio delay alignment, we decode from the start each time
+    and only yield the NEW samples that weren't sent before.
     """
     step_tokens = generation.step_tokens
     audio_buf = generation.audio_buf
@@ -81,14 +84,13 @@ def run_streaming_generation(
     max_delay = int(delay_tensor.max().item()) if delay_tensor.numel() else 0
     flush_tail = max_delay + getattr(runtime.machine, "max_padding", 0)
     
-    print(f"[streaming] max_delay={max_delay}, flush_tail={flush_tail}, cfg_active={cfg_active}")
+    print(f"[streaming] max_delay={max_delay}, flush_tail={flush_tail}")
     
     first_word_frame: Optional[int] = None
     eos_cutoff: Optional[int] = None
     last_step = start_step - 1
     
     use_graph = config.use_cuda_graph and runtime.device.type == "cuda"
-    print(f"[streaming] use_cuda_graph={config.use_cuda_graph}, device={runtime.device.type}, use_graph={use_graph}")
     
     sample_token_fn = sample_token
     sample_audio_logits_fn = sample_audio_logits
@@ -104,26 +106,27 @@ def run_streaming_generation(
     if use_graph:
         _ensure_graph_cublas_ready(runtime.device)
     
-    # Track chunks for streaming
-    last_decoded_frame = start_step
+    # Track streaming state
     sample_rate = runtime.mimi.sample_rate
+    last_yielded_sample = 0  # Track how many PCM samples we've already sent
+    last_chunk_frame = start_step
     
-    print(f"[streaming] Starting generation loop...")
+    # Mimi's frame rate (samples per frame)
+    # At 24kHz sample rate and ~12.5 Hz frame rate, each frame is ~1920 samples
+    samples_per_frame = sample_rate // 12  # Approximate
+    
+    print(f"[streaming] Starting generation loop, samples_per_frame~={samples_per_frame}")
     steps_completed = 0
     
     with torch.inference_mode():
         for offset in range(max_context):
             t = start_step + offset
             
-            # Debug first few iterations
-            if offset < 3:
-                print(f"[streaming] offset={offset}, t={t}, eos_cutoff={eos_cutoff}, state.end_step={state.end_step}")
-            
             if eos_cutoff is not None and t >= eos_cutoff:
                 print(f"[streaming] Breaking: t={t} >= eos_cutoff={eos_cutoff}")
                 break
             if t + 1 >= audio_buf.shape[-1]:
-                print(f"[streaming] Breaking: t+1={t+1} >= audio_buf.shape[-1]={audio_buf.shape[-1]}")
+                print(f"[streaming] Breaking: buffer full")
                 break
             
             generation.reset_dep_cache()
@@ -235,49 +238,56 @@ def run_streaming_generation(
             
             if eos_cutoff is None and state.end_step is not None:
                 eos_cutoff = state.end_step + flush_tail
-                print(f"[streaming] EOS detected at step {state.end_step}, eos_cutoff set to {eos_cutoff}")
+                print(f"[streaming] EOS detected at step {state.end_step}, eos_cutoff={eos_cutoff}")
             
             # Check if we should yield a chunk
-            frames_since_decode = (t + 1) - last_decoded_frame
+            frames_generated = t + 2 - start_step  # How many frames we have now
+            frames_since_last = t + 1 - last_chunk_frame
             is_final = (eos_cutoff is not None and t + 1 >= eos_cutoff) or (t + 2 >= audio_buf.shape[-1])
             
-            if frames_since_decode >= chunk_frames or is_final:
-                # Extract and decode the new frames
-                chunk_end = t + 2  # +2 because we just wrote to t+1
-                chunk_start = last_decoded_frame
+            # Only yield if we have enough frames (accounting for delay) or it's final
+            min_frames_for_decode = max_delay + 5  # Need at least this many to get output
+            
+            if (frames_since_last >= chunk_frames and frames_generated > min_frames_for_decode) or is_final:
+                # Decode ALL frames from start to current position
+                current_end = t + 2
+                all_tokens = audio_buf[0:1, :, :current_end].clone()
                 
-                print(f"[streaming] Yielding chunk: frames {chunk_start}-{chunk_end}, is_final={is_final}")
-                
-                # Get the audio tokens for this chunk
-                chunk_tokens = audio_buf[0:1, :, chunk_start:chunk_end].clone()
-                
-                # Undelay and decode
+                # Undelay the full buffer
                 aligned = undelay_frames(
-                    chunk_tokens[0], 
-                    runtime.audio_delays, 
+                    all_tokens[0],
+                    runtime.audio_delays,
                     token_ids.audio_pad
                 ).unsqueeze(0)
                 
                 if aligned.shape[-1] > 0:
-                    waveform = decode_audio_chunk(runtime, aligned)
-                    print(f"[streaming] Decoded waveform: {waveform.shape}")
+                    # Decode full audio
+                    full_waveform = decode_audio_chunk(runtime, aligned)
                     
-                    yield StreamingChunk(
-                        waveform=waveform,
-                        sample_rate=sample_rate,
-                        frame_start=chunk_start,
-                        frame_end=chunk_end,
-                        is_final=is_final,
-                    )
+                    # Only yield the NEW samples
+                    if full_waveform.shape[0] > last_yielded_sample:
+                        new_audio = full_waveform[last_yielded_sample:]
+                        print(f"[streaming] Yielding {new_audio.shape[0]} new samples (total {full_waveform.shape[0]}), is_final={is_final}")
+                        
+                        yield StreamingChunk(
+                            waveform=new_audio,
+                            sample_rate=sample_rate,
+                            frame_start=last_chunk_frame,
+                            frame_end=current_end,
+                            is_final=is_final,
+                        )
+                        
+                        last_yielded_sample = full_waveform.shape[0]
+                        last_chunk_frame = current_end
+                    else:
+                        print(f"[streaming] No new samples to yield")
                 else:
-                    print(f"[streaming] Skipping chunk: aligned.shape[-1] = 0")
-                
-                last_decoded_frame = chunk_end
+                    print(f"[streaming] aligned.shape[-1]=0, frames_generated={frames_generated}")
                 
                 if is_final:
                     break
     
-    print(f"[streaming] Loop finished, steps_completed={steps_completed}")
+    print(f"[streaming] Loop finished, steps_completed={steps_completed}, total_samples_yielded={last_yielded_sample}")
 
 
 __all__ = [
