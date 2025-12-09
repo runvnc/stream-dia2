@@ -44,20 +44,20 @@ def run_streaming_generation(
     config: GenerationConfig,
     start_step: int = 0,
     chunk_frames: int = 25,  # ~2 seconds at 12.5 Hz
+    include_prefix_audio: bool = False,
     logger: RuntimeLogger | None = None,
 ) -> Iterator[StreamingChunk]:
     """
     Streaming generation loop that yields audio chunks as they're generated.
     
-    Due to the delay alignment in audio codebooks, we decode from the start
-    each time but only yield the NEW samples not yet sent.
+    Args:
+        start_step: Frame to start generation from (after prefix warmup)
+        include_prefix_audio: If True, include prefix audio in output
     """
     step_tokens = generation.step_tokens
     audio_buf = generation.audio_buf
     branches = step_tokens.shape[0]
     max_context = runtime.config.runtime.max_context_steps
-    
-    print(f"[streaming] max_context={max_context}, start_step={start_step}")
     
     if max_context <= 0:
         raise ValueError("Runtime configuration must specify a positive max_context_steps")
@@ -93,13 +93,17 @@ def run_streaming_generation(
     
     # Streaming state
     sample_rate = runtime.mimi.sample_rate
-    samples_sent = 0  # Track how many PCM samples we've already sent
+    samples_per_frame = sample_rate // 12  # ~1920 samples per frame at 24kHz
+    
+    # Track where to start outputting audio (skip prefix unless include_prefix_audio)
+    output_start_frame = 0 if include_prefix_audio else start_step
+    samples_sent = 0
     last_decode_frame = start_step
     
-    # Need enough frames before first decode (to handle delay alignment)
+    # Need enough frames before first decode
     min_frames_for_decode = max_delay + 5
     
-    print(f"[streaming] max_delay={max_delay}, min_frames_for_decode={min_frames_for_decode}")
+    print(f"[streaming] start_step={start_step}, output_start_frame={output_start_frame}, include_prefix={include_prefix_audio}")
     steps_completed = 0
     
     with torch.inference_mode():
@@ -222,8 +226,8 @@ def run_streaming_generation(
             
             # Check if we should yield a chunk
             current_frame = t + 2
-            frames_available = current_frame - start_step
             frames_since_decode = current_frame - last_decode_frame
+            frames_available = current_frame - output_start_frame
             is_final = (eos_cutoff is not None and t + 1 >= eos_cutoff) or (t + 2 >= audio_buf.shape[-1])
             
             should_decode = (
@@ -232,8 +236,12 @@ def run_streaming_generation(
             )
             
             if should_decode:
-                # Decode all frames from start to current
-                all_tokens = audio_buf[0:1, :, :current_frame].clone()
+                # Decode frames from output_start_frame to current
+                # (This excludes prefix if include_prefix_audio is False)
+                decode_start = output_start_frame
+                decode_end = current_frame
+                
+                all_tokens = audio_buf[0:1, :, decode_start:decode_end].clone()
                 
                 aligned = undelay_frames(
                     all_tokens[0],
@@ -242,16 +250,14 @@ def run_streaming_generation(
                 ).unsqueeze(0)
                 
                 if aligned.shape[-1] > 0:
-                    # Decode to waveform
                     with torch.inference_mode():
                         pcm = runtime.mimi.decode(aligned)
                         full_waveform = torch.clamp(pcm[0, 0], -1.0, 1.0)
                     
-                    # Only yield NEW samples
                     total_samples = full_waveform.shape[0]
                     if total_samples > samples_sent:
                         new_samples = full_waveform[samples_sent:]
-                        print(f"[streaming] Yielding {new_samples.shape[0]} new samples (total: {total_samples}), is_final={is_final}")
+                        print(f"[streaming] Chunk: {new_samples.shape[0]} samples, is_final={is_final}")
                         
                         yield StreamingChunk(
                             waveform=new_samples,

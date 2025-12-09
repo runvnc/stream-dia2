@@ -10,6 +10,9 @@ import numpy as np
 import sounddevice as sd
 import websockets
 
+# Increase max message size to 16MB for large audio chunks
+WS_MAX_SIZE = 16 * 1024 * 1024
+
 
 def pcm16_to_float(pcm: bytes) -> np.ndarray:
     """Convert 16-bit little-endian PCM bytes to float32 [-1, 1]."""
@@ -39,7 +42,7 @@ class Dia2Client:
     
     async def connect(self) -> None:
         """Connect to the server."""
-        self.ws = await websockets.connect(self.ws_url)
+        self.ws = await websockets.connect(self.ws_url, max_size=WS_MAX_SIZE)
         
         # Wait for ready message
         msg = await self.ws.recv()

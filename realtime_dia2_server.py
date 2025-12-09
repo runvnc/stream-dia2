@@ -130,6 +130,10 @@ def _run_streaming_generation(
         start_step = 0
         if prefix_plan is not None:
             start_step = warmup_with_prefix(runtime, prefix_plan, state, gen_state)
+            print(f"[Dia2] Prefix warmup done, start_step={start_step}")
+        
+        # Determine if we should include prefix audio in output
+        include_prefix_audio = bool(prefix_plan and merged.prefix and merged.prefix.include_audio)
         
         chunk_count = 0
         for chunk in run_streaming_generation(
@@ -139,6 +143,7 @@ def _run_streaming_generation(
             config=merged,
             start_step=start_step,
             chunk_frames=chunk_frames,
+            include_prefix_audio=include_prefix_audio,
         ):
             chunk_count += 1
             pcm16_bytes = waveform_to_pcm16(chunk.waveform)
