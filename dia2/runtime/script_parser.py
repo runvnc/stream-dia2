@@ -23,17 +23,21 @@ def parse_script(
         if pending is not None:
             prefix = "[S1]" if pending == constants.spk1 else "[S2]"
             tokens = tokenizer.encode(f"{prefix} {word}", add_special_tokens=False)
+            # User explicitly specified speaker, update last_speaker_idx to match
+            last_speaker_idx[0] = 0 if pending == constants.spk1 else 1
+            first_content[0] = False  # Don't apply auto-speaker logic
         else:
             tokens = tokenizer.encode(word, add_special_tokens=False)
-        if first_content[0]:
-            if speaker_tokens:
-                speaker_idx = idx % len(speaker_tokens)
-                speaker_token = speaker_tokens[speaker_idx]
-                if speaker_token is not None and last_speaker_idx[0] != speaker_idx:
-                    if not tokens or tokens[0] != speaker_token:
-                        tokens.insert(0, speaker_token)
-                    last_speaker_idx[0] = speaker_idx
-            first_content[0] = False
+            # Only apply auto-speaker logic if user didn't specify a speaker
+            if first_content[0]:
+                if speaker_tokens:
+                    speaker_idx = idx % len(speaker_tokens)
+                    speaker_token = speaker_tokens[speaker_idx]
+                    if speaker_token is not None and last_speaker_idx[0] != speaker_idx:
+                        if not tokens or tokens[0] != speaker_token:
+                            tokens.insert(0, speaker_token)
+                        last_speaker_idx[0] = speaker_idx
+                first_content[0] = False
         padding = max(0, padding_between + len(tokens) - 1)
         entries.append(Entry(tokens=tokens, text=word, padding=padding))
 
