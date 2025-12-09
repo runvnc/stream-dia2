@@ -23,6 +23,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 # Import dia2 components
 from dia2 import Dia2, GenerationConfig, SamplingConfig
 from dia2.runtime import voice_clone
+from dia2 import engine as dia2_engine
 from dia2.runtime.voice_clone import WhisperWord, build_prefix_plan, PrefixPlan
 from dia2.runtime.audio_io import load_mono_audio, encode_audio_tokens
 from dia2.generation import PrefixConfig
@@ -202,6 +203,10 @@ def _cached_build_prefix_plan(runtime, prefix: Optional[PrefixConfig], **kwargs)
 print("[Dia2] Patching voice_clone.build_prefix_plan with cached version...")
 voice_clone.build_prefix_plan = _cached_build_prefix_plan
 
+# ALSO patch the reference in engine.py (it imports build_prefix_plan directly)
+print("[Dia2] Patching dia2.engine.build_prefix_plan...")
+dia2_engine.build_prefix_plan = _cached_build_prefix_plan
+
 
 def _preload_voice(audio_path: str) -> None:
     """Pre-transcribe AND pre-encode audio file to warm all caches.
@@ -337,6 +342,10 @@ def _generate_tts(
     """Generate TTS using dia2.generate() and return chunks."""
     t_start = time.perf_counter()
     print(f"[Dia2] Generating: {text[:80]}...")
+    print(f"[Dia2] DEBUG _generate_tts: prefix_speaker_1={prefix_speaker_1}")
+    print(f"[Dia2] DEBUG _generate_tts: prefix_speaker_2={prefix_speaker_2}")
+    print(f"[Dia2] DEBUG _generate_tts: cfg_scale={cfg_scale}")
+    print(f"[Dia2] DEBUG _generate_tts: text_temp={text_temperature}, audio_temp={audio_temperature}")
     
     cfg = GenerationConfig(
         cfg_scale=cfg_scale,
