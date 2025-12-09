@@ -91,6 +91,7 @@ def _run_streaming_generation(
     """Run streaming generation and put chunks into the queue."""
     try:
         print(f"[Dia2] Generating: {text[:50]}...")
+        print(f"[Dia2] prefix_speaker_1={prefix_speaker_1}, prefix_speaker_2={prefix_speaker_2}")
         runtime = dia._ensure_runtime()
         
         base_config = GenerationConfig(
@@ -175,6 +176,7 @@ async def stream_tts(ws: WebSocket):
     3. Client can send:
        - {"type": "set_voice", "speaker_1": "<base64>", "speaker_2": "<base64>"}
          Server responds: {"event": "voice_set"}
+         Note: Only updates voices that are provided. Use "clear": true to reset all.
        - {"type": "tts", "text": "[S1] Hello..."}
          Server streams audio chunks, then {"event": "done"}
        - {"type": "close"}
@@ -212,17 +214,28 @@ async def stream_tts(ws: WebSocket):
             
             # Handle set_voice command
             if msg_type == "set_voice":
-                # Clean up old temp files
-                for f in temp_files:
-                    try:
-                        os.unlink(f)
-                    except:
-                        pass
-                temp_files = []
-                prefix_speaker_1 = None
-                prefix_speaker_2 = None
+                # Only clear if explicitly requested
+                if payload.get("clear"):
+                    for f in temp_files:
+                        try:
+                            os.unlink(f)
+                        except:
+                            pass
+                    temp_files = []
+                    prefix_speaker_1 = None
+                    prefix_speaker_2 = None
+                    print("[Dia2] Cleared all voices")
                 
+                # Update speaker 1 if provided
                 if payload.get("speaker_1"):
+                    # Remove old speaker 1 temp file if exists
+                    if prefix_speaker_1 and prefix_speaker_1 in temp_files:
+                        try:
+                            os.unlink(prefix_speaker_1)
+                            temp_files.remove(prefix_speaker_1)
+                        except:
+                            pass
+                    
                     suffix = payload.get("format_1", ".wav")
                     if not suffix.startswith("."):
                         suffix = "." + suffix
@@ -230,8 +243,17 @@ async def stream_tts(ws: WebSocket):
                     prefix_speaker_1 = path
                     temp_files.append(path)
                     print(f"[Dia2] Set speaker 1 voice: {path}")
-                    
+                
+                # Update speaker 2 if provided
                 if payload.get("speaker_2"):
+                    # Remove old speaker 2 temp file if exists
+                    if prefix_speaker_2 and prefix_speaker_2 in temp_files:
+                        try:
+                            os.unlink(prefix_speaker_2)
+                            temp_files.remove(prefix_speaker_2)
+                        except:
+                            pass
+                    
                     suffix = payload.get("format_2", ".wav")
                     if not suffix.startswith("."):
                         suffix = "." + suffix
@@ -240,7 +262,12 @@ async def stream_tts(ws: WebSocket):
                     temp_files.append(path)
                     print(f"[Dia2] Set speaker 2 voice: {path}")
                 
-                await ws.send_text(json.dumps({"event": "voice_set"}))
+                # Report current state
+                await ws.send_text(json.dumps({
+                    "event": "voice_set",
+                    "speaker_1": prefix_speaker_1 is not None,
+                    "speaker_2": prefix_speaker_2 is not None,
+                }))
                 continue
             
             # Handle close command
