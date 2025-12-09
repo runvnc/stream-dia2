@@ -127,13 +127,14 @@ def _run_streaming_generation(
     temperature: float = 0.8,
     top_k: int = 50,
     use_cuda_graph: bool = True,
-    chunk_frames: int = 15,  # ~1.2 seconds per chunk
+    chunk_frames: int = 15,
 ) -> None:
     """
     Run streaming generation and put chunks into the queue.
     This runs in the CUDA executor thread.
     """
     try:
+        print(f"[Dia2] Starting streaming generation for: {text[:50]}...")
         runtime = dia._ensure_runtime()
         
         # Build config
@@ -169,6 +170,8 @@ def _run_streaming_generation(
             runtime.frame_rate
         ))
         
+        print(f"[Dia2] Parsed {len(entries)} script entries")
+        
         # Initialize state
         runtime.machine.initial_padding = merged.initial_padding
         state = runtime.machine.new_state(entries)
@@ -178,8 +181,10 @@ def _run_streaming_generation(
         start_step = 0
         if prefix_plan is not None:
             start_step = warmup_with_prefix(runtime, prefix_plan, state, gen_state)
+            print(f"[Dia2] Warmed up with prefix, starting at step {start_step}")
         
         # Run streaming generation
+        chunk_count = 0
         for chunk in run_streaming_generation(
             runtime,
             state=state,
@@ -188,8 +193,10 @@ def _run_streaming_generation(
             start_step=start_step,
             chunk_frames=chunk_frames,
         ):
-            # Convert to PCM16 and queue
+            chunk_count += 1
             pcm16_bytes = waveform_to_pcm16(chunk.waveform)
+            print(f"[Dia2] Chunk {chunk_count}: {len(pcm16_bytes)} bytes, frames {chunk.frame_start}-{chunk.frame_end}, final={chunk.is_final}")
+            
             output_queue.put(AudioChunk(
                 pcm16=pcm16_bytes,
                 sample_rate=chunk.sample_rate,
@@ -198,13 +205,14 @@ def _run_streaming_generation(
             
             if chunk.is_final:
                 break
+        
+        print(f"[Dia2] Generation complete, {chunk_count} chunks produced")
                 
     except Exception as e:
         print(f"[Dia2] Streaming generation error: {e}")
         import traceback
         traceback.print_exc()
     finally:
-        # Signal completion
         output_queue.put(None)
 
 
@@ -287,8 +295,10 @@ async def tts_once(payload: dict):
 @app.websocket("/ws/stream_tts")
 async def stream_tts(ws: WebSocket):
     await ws.accept()
+    print("[Dia2] WebSocket connection accepted")
     try:
         msg = await ws.receive_text()
+        print(f"[Dia2] Received message: {msg[:100]}...")
         try:
             payload = json.loads(msg)
         except json.JSONDecodeError:
@@ -302,12 +312,15 @@ async def stream_tts(ws: WebSocket):
             await ws.close(code=1003)
             return
 
+        print(f"[Dia2] Processing text: {text}")
+
         # Send config
         await ws.send_text(json.dumps({
             "event": "config", 
             "sample_rate": dia.sample_rate,
             "streaming": True,
         }))
+        print(f"[Dia2] Sent config, sample_rate={dia.sample_rate}")
 
         # Create queue for streaming chunks
         chunk_queue: Queue = Queue()
@@ -330,17 +343,15 @@ async def stream_tts(ws: WebSocket):
         )
 
         # Stream chunks to client as they arrive
+        chunks_sent = 0
         while True:
-            # Poll queue with timeout to allow async cooperation
             try:
                 chunk = await loop.run_in_executor(
-                    None,  # Default executor
+                    None,
                     lambda: chunk_queue.get(timeout=0.1)
                 )
             except Empty:
-                # Check if generation is done
                 if gen_future.done():
-                    # Drain remaining items
                     while True:
                         try:
                             chunk = chunk_queue.get_nowait()
@@ -348,22 +359,27 @@ async def stream_tts(ws: WebSocket):
                                 break
                             header = struct.pack("!?", chunk.is_last)
                             await ws.send_bytes(header + chunk.pcm16)
+                            chunks_sent += 1
+                            print(f"[Dia2] Sent chunk {chunks_sent} ({len(chunk.pcm16)} bytes)")
                         except Empty:
                             break
                     break
                 continue
             
             if chunk is None:
+                print("[Dia2] Received None from queue, generation complete")
                 break
                 
-            # Send chunk to client
             header = struct.pack("!?", chunk.is_last)
             await ws.send_bytes(header + chunk.pcm16)
+            chunks_sent += 1
+            print(f"[Dia2] Sent chunk {chunks_sent} ({len(chunk.pcm16)} bytes)")
             
             if chunk.is_last:
                 break
 
         await ws.send_text(json.dumps({"event": "done"}))
+        print(f"[Dia2] Stream complete, sent {chunks_sent} chunks total")
 
     except WebSocketDisconnect:
         print("[Dia2] WebSocket disconnected")
