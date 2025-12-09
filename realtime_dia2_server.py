@@ -162,11 +162,26 @@ def _cached_build_prefix_plan(runtime, prefix: Optional[PrefixConfig], **kwargs)
     if prefix is None:
         return None
     
+    # Debug: Check speaker token mapping
+    convert = getattr(runtime.tokenizer, "convert_tokens_to_ids", None)
+    if callable(convert):
+        s1_id = convert("[S1]")
+        s2_id = convert("[S2]")
+        print(f"[Dia2] DEBUG: Token IDs - [S1]={s1_id}, [S2]={s2_id}")
+        print(f"[Dia2] DEBUG: Constants - spk1={runtime.constants.spk1}, spk2={runtime.constants.spk2}")
+        if s1_id != runtime.constants.spk1:
+            print(f"[Dia2] WARNING: [S1] token ID mismatch! {s1_id} != {runtime.constants.spk1}")
+        if s2_id != runtime.constants.spk2:
+            print(f"[Dia2] WARNING: [S2] token ID mismatch! {s2_id} != {runtime.constants.spk2}")
+    
+    # Debug: Show prefix config
+    print(f"[Dia2] DEBUG: PrefixConfig - speaker_1={prefix.speaker_1}, speaker_2={prefix.speaker_2}")
+    
     # Create encode function that uses our cache
     def cached_encode_fn(audio: np.ndarray) -> torch.Tensor:
         return _cached_encode_audio(runtime.mimi, audio)
     
-    return _original_build_prefix_plan(
+    result = _original_build_prefix_plan(
         runtime,
         prefix,
         transcribe_fn=_cached_transcribe_words,
@@ -174,6 +189,14 @@ def _cached_build_prefix_plan(runtime, prefix: Optional[PrefixConfig], **kwargs)
         encode_fn=cached_encode_fn,
         **kwargs
     )
+    
+    # Debug: Show what entries were created
+    if result:
+        print(f"[Dia2] DEBUG: PrefixPlan has {len(result.entries)} entries, {result.aligned_frames} frames")
+        for i, entry in enumerate(result.entries[:5]):  # Show first 5
+            print(f"[Dia2] DEBUG:   Entry {i}: tokens={entry.tokens[:3]}... text='{entry.text}'")
+    
+    return result
 
 # Monkey-patch build_prefix_plan
 print("[Dia2] Patching voice_clone.build_prefix_plan with cached version...")
