@@ -9,6 +9,7 @@ authors = [
 
 # Runtime deps for the server; dia2 itself must be installed separately
 dependencies = [
+  "dia2 @ git+https://github.com/nari-labs/dia2.git",
   "fastapi",
   "uvicorn[standard]",
   "numpy",
@@ -39,3 +40,21 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 packages = ["stream_dia2_client"]
+
+# Dia2 itself is installed from GitHub; this assumes you have a compiler/CUDA ready.
+# You can let uv/pip install it directly from the repo like this:
+#
+# For uv (recommended):
+#   uv add "dia2 @ git+https://github.com/nari-labs/dia2.git"
+#
+# Or edit [project].dependencies above to include a line like:
+#   "dia2 @ git+https://github.com/nari-labs/dia2.git"
+#
+# Then run:
+#   uv sync
+#
+# After that, `uv run uvicorn realtime_dia2_server:app --host 0.0.0.0 --port 8000`
+# will see the dia2 module.
+
+# Added Dia2 from GitHub as a dependency
+# NOTE: uv/pip will install from this repo URL.
