@@ -156,7 +156,7 @@ async def stream_tts(ws: WebSocket):
     async def keepalive():
         try:
             while True:
-                await asyncio.sleep(30)
+                await asyncio.sleep(15)
                 await ws.send_text(json.dumps({"event": "ping"}))
         except:
             pass
@@ -171,7 +171,7 @@ async def stream_tts(ws: WebSocket):
         
         while True:
             try:
-                msg = await asyncio.wait_for(ws.receive_text(), timeout=300)
+                msg = await ws.receive_text()
             except asyncio.TimeoutError:
                 await ws.send_text(json.dumps({"event": "ping"}))
                 continue
