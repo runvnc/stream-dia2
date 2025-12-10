@@ -140,9 +140,11 @@ def run_streaming_generation(
     if mimi_kv is None and not include_prefix_audio and start_step > 0:
         t_mimi_warmup_start = time.perf_counter()
         # Decode prefix frames to build Mimi KV cache (discard audio output)
-        prefix_tokens = audio_buf[0:1, :, :start_step].clone()
-        if prefix_tokens.shape[-1] > 0:
+        prefix_tokens_delayed = audio_buf[0:1, :, :start_step].clone()
+        if prefix_tokens_delayed.shape[-1] > 0:
             try:
+                # Undelay the tokens before passing to Mimi
+                prefix_tokens = undelay_frames(prefix_tokens_delayed[0], runtime.audio_delays, token_ids.audio_pad).unsqueeze(0)
                 _, mimi_kv = runtime.mimi.decode_streaming(prefix_tokens, None)
                 t_mimi_warmup = time.perf_counter() - t_mimi_warmup_start
                 print(f"[streaming] Mimi warmup: {t_mimi_warmup*1000:.0f}ms ({start_step} frames)")
