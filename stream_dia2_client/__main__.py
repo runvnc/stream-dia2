@@ -16,6 +16,7 @@ WS_MAX_SIZE = 16 * 1024 * 1024
 # Default CFG scale (1.0 = no guidance, higher = stronger voice matching)
 DEFAULT_CFG_SCALE = 1.0
 DEFAULT_TEMPERATURE = 0.8
+DEFAULT_BUFFER_MS = 0  # No buffering by default - immediate playback
 
 
 def pcm16_to_float(pcm: bytes) -> np.ndarray:
@@ -38,7 +39,7 @@ def load_audio_as_base64(path: str) -> tuple[str, str]:
 class Dia2Client:
     """Persistent WebSocket client for Dia2 TTS with auto-reconnect."""
     
-    def __init__(self, ws_url: str = "ws://localhost:8000/ws/stream_tts"):
+    def __init__(self, ws_url: str = "ws://localhost:8000/ws/stream_tts", buffer_ms: int = DEFAULT_BUFFER_MS):
         self.ws_url = ws_url
         self.ws: Optional[websockets.WebSocketClientProtocol] = None
         self.sample_rate: int = 24000
@@ -51,6 +52,7 @@ class Dia2Client:
         self._connected: bool = False
         self._reconnect_attempts: int = 0
         self._max_reconnect_attempts: int = 5
+        self.buffer_ms: int = buffer_ms
     
     async def connect(self) -> None:
         """Connect to the server."""
@@ -185,8 +187,6 @@ class Dia2Client:
             await self.ws.send(json.dumps(payload))
         
         # Start audio stream
-        # Buffer chunks before starting playback to avoid underruns
-        audio_buffer: list[np.ndarray] = []
         self.stream = sd.OutputStream(
             samplerate=self.sample_rate,
             channels=1,
@@ -195,8 +195,11 @@ class Dia2Client:
         self.stream.start()
         
         chunks_received = 0
-        playback_started = False
-        buffer_target_samples = int(self.sample_rate * 2.5)  # Buffer 2.5 seconds before playing
+        
+        # Optional buffering
+        audio_buffer: list[np.ndarray] = []
+        playback_started = (self.buffer_ms == 0)  # Start immediately if no buffer
+        buffer_target_samples = int(self.sample_rate * self.buffer_ms / 1000)
         buffered_samples = 0
         
         try:
@@ -243,7 +246,6 @@ class Dia2Client:
                         
                         if buffered_samples >= buffer_target_samples or is_last:
                             # Start playback with buffered audio
-                            print(f"[client] Starting playback ({buffered_samples / self.sample_rate:.1f}s buffered)")
                             for buffered_chunk in audio_buffer:
                                 self.stream.write(buffered_chunk)
                             audio_buffer.clear()
@@ -278,12 +280,13 @@ async def interactive_mode(
     speaker_2_path: Optional[str] = None,
     temperature: float = DEFAULT_TEMPERATURE,
     cfg_scale: float = DEFAULT_CFG_SCALE,
+    buffer_ms: int = DEFAULT_BUFFER_MS,
 ) -> None:
     """Interactive mode with persistent connection."""
     print("\n=== Dia2 Interactive Mode ===")
     print("Connecting...")
     
-    client = Dia2Client(ws_url)
+    client = Dia2Client(ws_url, buffer_ms=buffer_ms)
     client.cfg_scale = cfg_scale
     client.temperature = temperature
     await client.connect()
@@ -376,9 +379,10 @@ async def single_shot(
     include_prefix: bool = False,
     temperature: float = DEFAULT_TEMPERATURE,
     cfg_scale: float = DEFAULT_CFG_SCALE,
+    buffer_ms: int = DEFAULT_BUFFER_MS,
 ) -> None:
     """Single TTS request."""
-    client = Dia2Client(ws_url)
+    client = Dia2Client(ws_url, buffer_ms=buffer_ms)
     client.cfg_scale = cfg_scale
     await client.connect()
     
@@ -401,6 +405,7 @@ def main() -> None:
     parser.add_argument("--temp", type=float, default=DEFAULT_TEMPERATURE, help=f"Temperature (default: {DEFAULT_TEMPERATURE})")
     parser.add_argument("--cfg", type=float, default=DEFAULT_CFG_SCALE, help=f"CFG scale (default: {DEFAULT_CFG_SCALE})")
     parser.add_argument("--include-prefix", action="store_true", help="Include prefix audio in output")
+    parser.add_argument("--buffer", type=int, default=DEFAULT_BUFFER_MS, help=f"Audio buffer in ms before playback (default: {DEFAULT_BUFFER_MS})")
     
     args = parser.parse_args()
     
@@ -411,6 +416,7 @@ def main() -> None:
             speaker_2_path=args.voice2,
             temperature=args.temp,
             cfg_scale=args.cfg,
+            buffer_ms=args.buffer,
         ))
         return
     
@@ -430,6 +436,7 @@ def main() -> None:
         include_prefix=args.include_prefix,
         temperature=args.temp,
         cfg_scale=args.cfg,
+        buffer_ms=args.buffer,
     ))
 
 
