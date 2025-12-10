@@ -77,6 +77,16 @@ async def stream_tts(
                         line = line.strip()
                         if not line: continue
                         
+                        # Handle speaker commands
+                        if line.lower().startswith("/s1 "):
+                            line = "[S1] " + line[4:]
+                        elif line.lower().startswith("/s2 "):
+                            line = "[S2] " + line[4:]
+                        elif not line.startswith("[") and not line.startswith("!"):
+                            # Default to S2 if no tag provided (optional, but helpful for user)
+                            # Actually, let's just let the user type. But if they want S2, they should use /s2 or [S2]
+                            pass
+                        
                         if line.startswith("!append "):
                             parts = line.split(" ", 1)
                             if len(parts) > 1:

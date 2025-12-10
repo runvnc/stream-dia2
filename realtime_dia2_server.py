@@ -118,6 +118,7 @@ class ContinuousSession:
         self.runtime = runtime
         self.input_queue = asyncio.Queue()
         self.stop_event = asyncio.Event()
+        self.samples_to_skip = 0
         
         # Setup state
         self._setup(speaker_1_path, speaker_2_path)
@@ -153,6 +154,13 @@ class ContinuousSession:
         # Buffers
         self.cached_graphs = CachedGraphs()
         self.cached_graphs.mimi_kv = self.mimi_kv
+        
+        # Calculate samples to skip (delay tail of the prefix)
+        # The decoder output lags behind by max_delay frames.
+        # We want to skip the audio corresponding to the prefix we already have.
+        max_delay = int(self.runtime.audio_delay_tensor.max().item()) if self.runtime.audio_delay_tensor.numel() else 0
+        self.samples_to_skip = max_delay * self.runtime.mimi.samples_per_frame
+        print(f"[Dia2] Will skip first {self.samples_to_skip} samples (prefix tail).")
         
         print("[Dia2] Session ready.")
 
@@ -202,6 +210,7 @@ class ContinuousSession:
         # Streaming state
         chunk_frames = 3
         last_decode_pos = self.current_step
+        skipped_samples = 0
         sent_done = False
         steps_since_input = 0
         
@@ -402,9 +411,16 @@ class ContinuousSession:
                 waveform = torch.clamp(pcm[0, 0], -1.0, 1.0)
                 
                 if waveform.shape[0] > 0:
-                    pcm16 = (waveform.detach().cpu().numpy() * 32767.0).astype(np.int16).tobytes()
-                    header = struct.pack("!?", False)
-                    await websocket.send_bytes(header + pcm16)
+                    # Skip initial samples if needed (to avoid playing prefix tail/clicks)
+                    if skipped_samples < self.samples_to_skip:
+                        to_skip = min(waveform.shape[0], self.samples_to_skip - skipped_samples)
+                        waveform = waveform[to_skip:]
+                        skipped_samples += to_skip
+                    
+                    if waveform.shape[0] > 0:
+                        pcm16 = (waveform.detach().cpu().numpy() * 32767.0).astype(np.int16).tobytes()
+                        header = struct.pack("!?", False)
+                        await websocket.send_bytes(header + pcm16)
                 
                 last_decode_pos = current_pos
                 
