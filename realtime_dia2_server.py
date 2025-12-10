@@ -248,6 +248,15 @@ def _create_voice_session(speaker_1_path: str, speaker_2_path: str) -> VoiceSess
     # Run warmup
     start_step = warmup_with_prefix(runtime, prefix_plan, warmup_state, gen_state)
     
+    # CRITICAL FIX: Clear any pending text tokens from the prefix state.
+    # If the prefix alignment was tight, some text tokens might remain in pending_tokens.
+    # Since the audio for the prefix is already generated (provided), we must NOT
+    # let the model generate these text tokens again, or it will speak the prefix text.
+    print(f"[Dia2] Clearing {len(warmup_state.pending_tokens)} pending tokens and {len(warmup_state.entries)} remaining entries from warmup state.")
+    warmup_state.pending_tokens.clear()
+    warmup_state.entries.clear()
+    warmup_state.forced_padding = 0
+    
     # Warm up Mimi decoder by decoding the prefix
     # This ensures mimi_kv is populated and we don't have a delay on first TTS
     print("[Dia2] Warming up Mimi decoder...")
