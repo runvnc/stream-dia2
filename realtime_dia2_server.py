@@ -324,7 +324,7 @@ class ContinuousSession:
             
             # 2. Run one generation step
             if steps_since_input % 50 == 0 and not is_idle:
-                print(f"[Dia2] Step {self.current_step}: {len(state.entries)} entries, {len(state.pending_tokens)} pending tokens")
+                print(f"[Dia2] Step {self.current_step}: entries={len(state.entries)}, pending={len(state.pending_tokens)}, end_step={state.end_step}, flush_target={flush_target}")
             steps_since_input += 1
 
             t = self.current_step
