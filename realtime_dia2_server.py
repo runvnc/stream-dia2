@@ -247,6 +247,18 @@ def _create_voice_session(speaker_1_path: str, speaker_2_path: str) -> VoiceSess
     # Run warmup
     start_step = warmup_with_prefix(runtime, prefix_plan, warmup_state, gen_state)
     
+    # Warm up Mimi decoder by decoding the prefix
+    # This ensures mimi_kv is populated and we don't have a delay on first TTS
+    print("[Dia2] Warming up Mimi decoder...")
+    prefix_len = prefix_plan.aligned_frames
+    # We need to decode the prefix tokens to get the state
+    # The tokens are in gen_state.audio_buf
+    # We decode in chunks to simulate streaming if needed, or just one go
+    # But decode_streaming expects [B, C, T]
+    prefix_tokens = gen_state.audio_buf[:, :, :prefix_len].clone()
+    _, mimi_kv = runtime.mimi.decode_streaming(prefix_tokens, None)
+    print("[Dia2] Mimi decoder warmed up.")
+    
     # Snapshot the state machine after warmup for fast restoration
     warmup_state_snapshot = copy.deepcopy(warmup_state)
     
@@ -265,6 +277,9 @@ def _create_voice_session(speaker_1_path: str, speaker_2_path: str) -> VoiceSess
     
     # Create empty graph cache - will be populated on first TTS
     cached_graphs = CachedGraphs()
+    
+    # Store the warmed mimi state in cached_graphs
+    cached_graphs.mimi_kv = mimi_kv
     
     elapsed = time.perf_counter() - t0
     print(f"[Dia2] Voice session ready in {elapsed:.2f}s (start_step={start_step}, cache_len={prefix_cache_length})")
@@ -302,6 +317,7 @@ def _reset_session_for_new_tts(session: VoiceSession) -> None:
     session.gen_state.audio_buf[:, :, prefix_len:].fill_(runtime.constants.ungenerated)
     session.current_step = session.start_step
     session.current_state = copy.deepcopy(session.warmup_state)
+    # Note: We do NOT reset cached_graphs.mimi_kv because we want to continue from prefix audio context
 
 
 def _clear_voice_session() -> None:

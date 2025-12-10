@@ -44,6 +44,7 @@ class CachedGraphs:
     dep_captures: Optional[List[Dict]] = None
     buffers: Optional[NetworkBuffers] = None
     positions: Optional[torch.Tensor] = None
+    mimi_kv: Optional[Any] = None
 
 
 def run_streaming_generation(
@@ -58,7 +59,6 @@ def run_streaming_generation(
     logger: RuntimeLogger | None = None,
     cached_graphs: Optional[CachedGraphs] = None,
     prefix_samples_to_skip: int = 0,
-    initial_mimi_kv: Optional[Any] = None,
 ) -> Iterator[StreamingChunk]:
     """
     Streaming generation loop that yields audio chunks as they're generated.
@@ -140,11 +140,16 @@ def run_streaming_generation(
     
     # Due to delay pattern, first max_delay frames of decoded output are prefix audio.
     # We need to skip max_delay * samples_per_frame samples before outputting new audio.
-    samples_to_skip = max_delay * samples_per_frame
-    print(f"[streaming] max_delay={max_delay}, samples_to_skip={samples_to_skip}, start_step={start_step}")
+    # UNLESS we are continuing from a cached Mimi state.
     
-    # Start Mimi fresh - no warmup needed with this approach
     mimi_kv = None
+    if cached_graphs is not None and cached_graphs.mimi_kv is not None:
+        mimi_kv = cached_graphs.mimi_kv
+        samples_to_skip = 0
+        print(f"[streaming] Resuming Mimi state. max_delay={max_delay}, samples_to_skip=0")
+    else:
+        samples_to_skip = max_delay * samples_per_frame
+        print(f"[streaming] Fresh Mimi state. max_delay={max_delay}, samples_to_skip={samples_to_skip}")
     
     first_frame_time = None
     first_audio_time = None
@@ -303,6 +308,10 @@ def run_streaming_generation(
                 
                 # Decode with Mimi streaming
                 pcm, mimi_kv = runtime.mimi.decode_streaming(new_tokens, mimi_kv)
+                
+                if cached_graphs is not None:
+                    cached_graphs.mimi_kv = mimi_kv
+                    
                 waveform = torch.clamp(pcm[0, 0], -1.0, 1.0)
                 
                 # Skip prefix samples due to delay pattern
