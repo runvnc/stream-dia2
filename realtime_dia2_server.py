@@ -401,6 +401,12 @@ def _append_prefix_sequence(runtime, session: VoiceSession, prefix_plan: PrefixP
             # step_tokens already contains the correct delayed values for step t
             generation.audio_buf[:, :, t] = step_tokens[:, :, 0]
 
+    # Clear any pending tokens from the appended sequence so they aren't generated again
+    print(f"[Dia2] Appended audio. Clearing {len(state.pending_tokens)} pending tokens.")
+    state.pending_tokens.clear()
+    state.entries.clear()
+    state.forced_padding = 0
+
     return start_step + prefix_plan.aligned_frames
 
 
