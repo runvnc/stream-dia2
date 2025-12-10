@@ -91,6 +91,7 @@ def run_streaming_generation(
     delay_tensor = runtime.audio_delay_tensor
     max_delay = int(delay_tensor.max().item()) if delay_tensor.numel() else 0
     flush_tail = max_delay + getattr(runtime.machine, "max_padding", 0)
+    print(f"[streaming] max_delay={max_delay}, audio_delays={runtime.audio_delays}")
     
     first_word_frame: Optional[int] = None
     eos_cutoff: Optional[int] = None
@@ -274,6 +275,8 @@ def run_streaming_generation(
             if should_decode:
                 decode_start = output_start_frame
                 decode_end = current_frame
+                decode_frames = decode_end - decode_start
+                decode_attempt = steps_completed if 'steps_completed' not in dir() else offset + 1
                 
                 t_decode_start = time.perf_counter()
                 all_tokens = audio_buf[0:1, :, decode_start:decode_end].clone()
@@ -285,6 +288,10 @@ def run_streaming_generation(
                     token_ids.audio_pad
                 ).unsqueeze(0)
                 t_undelay = time.perf_counter()
+                aligned_frames = aligned.shape[-1]
+                
+                if first_decode_time is None:
+                    print(f"[streaming] Decode attempt: input_frames={decode_frames}, aligned_frames={aligned_frames}")
                 
                 if aligned.shape[-1] > 0:
                     pcm = runtime.mimi.decode(aligned)
