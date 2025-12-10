@@ -202,6 +202,7 @@ class ContinuousSession:
         chunk_frames = 3
         last_decode_pos = self.current_step
         sent_done = False
+        steps_since_input = 0
         
         print("[Dia2] Starting continuous generation loop...")
         
@@ -253,6 +254,7 @@ class ContinuousSession:
                 item_type, item_data = new_item
                 if item_type == 'text':
                     state.entries.extend(item_data)
+                    steps_since_input = 0
                     print(f"[Dia2] Processing text input ({len(item_data)} entries)")
                 elif item_type == 'audio':
                     # Process audio insertion immediately
@@ -310,6 +312,10 @@ class ContinuousSession:
                     continue
             
             # 2. Run one generation step
+            if steps_since_input % 50 == 0 and not is_idle:
+                print(f"[Dia2] Step {self.current_step}: {len(state.entries)} entries, {len(state.pending_tokens)} pending tokens")
+            steps_since_input += 1
+
             t = self.current_step
             if t + 1 >= audio_buf.shape[-1]:
                 print("[Dia2] Context limit reached. Resetting session (TODO).")
