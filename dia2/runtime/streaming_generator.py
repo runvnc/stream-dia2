@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 
 from dataclasses import dataclass
-from typing import Iterator, Optional, Any, Tuple, List, Dict
+from typing import Iterator, Optional, Any, Tuple, List, Dict, Union
 
 import torch
 
@@ -56,6 +56,7 @@ def run_streaming_generation(
     include_prefix_audio: bool = False,
     logger: RuntimeLogger | None = None,
     cached_graphs: Optional[CachedGraphs] = None,
+    mimi_past_kv: Optional[Any] = None,
 ) -> Iterator[StreamingChunk]:
     """
     Streaming generation loop that yields audio chunks as they're generated.
@@ -70,6 +71,7 @@ def run_streaming_generation(
         include_prefix_audio: If True, include prefix audio in output
         logger: Optional logger for progress
         cached_graphs: Optional pre-captured CUDA graphs for faster first chunk
+        mimi_past_kv: Optional pre-warmed Mimi decoder KV cache (from prefix)
         
     Yields:
         StreamingChunk objects containing waveform data
@@ -127,7 +129,8 @@ def run_streaming_generation(
     last_decode_frame = start_step
     
     # Streaming decode state
-    mimi_past_kv = None
+    # Use pre-warmed KV cache if provided
+    mimi_kv = mimi_past_kv
     
     # Need enough frames before first decode
     min_frames_for_decode = 1  # Send first frame ASAP
@@ -291,7 +294,7 @@ def run_streaming_generation(
                 
                 # Use streaming decode with KV cache
                 try:
-                    pcm, mimi_past_kv = runtime.mimi.decode_streaming(new_tokens, mimi_past_kv)
+                    pcm, mimi_kv = runtime.mimi.decode_streaming(new_tokens, mimi_kv)
                     waveform = torch.clamp(pcm[0, 0], -1.0, 1.0)
                 except Exception as e:
                     if first_decode_time is None:

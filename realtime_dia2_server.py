@@ -1,6 +1,6 @@
 """Dia2 TTS Server with pre-warmed voice state for minimal latency.
 
-Single conversation mode - pre-warms once, reuses state for each TTS request.
+Single conversation mode - pre-warms voice and Mimi decoder, reuses state for each TTS request.
 Requires BOTH speaker_1 and speaker_2 for voice cloning to work.
 """
 import asyncio
@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from queue import Queue, Empty
 import time
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 
 import numpy as np
 import torch
@@ -51,6 +51,7 @@ class VoiceSession:
     prefix_cache_length: int
     prefix_audio_tokens: torch.Tensor
     cached_graphs: CachedGraphs  # Reusable CUDA graphs
+    mimi_past_kv: Any = None  # Pre-warmed Mimi decoder state
 
 
 _voice_session: Optional[VoiceSession] = None
@@ -248,12 +249,18 @@ def _create_voice_session(speaker_1_path: str, speaker_2_path: str) -> VoiceSess
     prefix_len = prefix_plan.aligned_frames + 10
     prefix_audio_tokens = gen_state.audio_buf[:, :, :prefix_len].clone()
     
-    # Warm up Mimi decoder to avoid first-call latency
-    print("[Dia2] Warming up Mimi decoder...")
+    # Warm up Mimi decoder with prefix frames to build KV cache
+    print("[Dia2] Warming up Mimi decoder with prefix...")
     t_mimi = time.perf_counter()
-    dummy_tokens = torch.zeros((1, runtime.model.depformer.num_audio_channels, 10), dtype=torch.long, device=runtime.device)
+    
+    # Feed prefix frames one at a time to build up KV cache
+    mimi_past_kv = None
+    prefix_frames = prefix_plan.aligned_frames
     with torch.inference_mode():
-        _ = runtime.mimi.decode(dummy_tokens)
+        for i in range(prefix_frames):
+            frame_tokens = gen_state.audio_buf[0:1, :, i:i+1]
+            _, mimi_past_kv = runtime.mimi.decode_streaming(frame_tokens, mimi_past_kv)
+    
     print(f"[Dia2] Mimi warmup: {(time.perf_counter() - t_mimi)*1000:.0f}ms")
     
     # Create empty graph cache - will be populated on first TTS
@@ -269,6 +276,7 @@ def _create_voice_session(speaker_1_path: str, speaker_2_path: str) -> VoiceSess
         prefix_cache_length=prefix_cache_length,
         prefix_audio_tokens=prefix_audio_tokens,
         cached_graphs=cached_graphs,
+        mimi_past_kv=mimi_past_kv,
     )
     
     return _voice_session
@@ -337,6 +345,7 @@ def _run_streaming_tts(
     temperature: float = 0.8,
     top_k: int = 50,
     chunk_frames: int = 1,  # Send every frame immediately
+    mimi_past_kv: Any = None,
 ) -> None:
     """Run streaming TTS using the pre-warmed voice session."""
     try:
@@ -394,6 +403,7 @@ def _run_streaming_tts(
             chunk_frames=chunk_frames,
             include_prefix_audio=False,
             cached_graphs=session.cached_graphs,
+            mimi_past_kv=mimi_past_kv,
         ):
             chunk_count += 1
             pcm16_bytes = waveform_to_pcm16(chunk.waveform)
@@ -560,6 +570,7 @@ async def stream_tts(ws: WebSocket):
                         temperature=float(payload.get("temperature", 0.8)),
                         top_k=int(payload.get("top_k", 50)),
                         chunk_frames=int(payload.get("chunk_frames", 1)),
+                        mimi_past_kv=_voice_session.mimi_past_kv,
                     )
                 )
                 
