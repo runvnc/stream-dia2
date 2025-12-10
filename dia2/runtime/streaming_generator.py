@@ -178,18 +178,22 @@ def run_streaming_generation(
     if mimi_kv is None and start_step > 0:
         t_warmup_start = time.perf_counter()
         # Decode prefix frames to build Mimi KV cache
-        # We need to undelay the prefix first
         prefix_end = start_step  # Delayed frames 0 to start_step-1
         if prefix_end > max_delay:
-            # We can undelay some prefix frames
-            undelayed_prefix_end = prefix_end - max_delay
-            for frame_idx in range(undelayed_prefix_end):
-                undelayed_frame = _undelay_single_frame(
-                    audio_buf[0:1], frame_idx, delays, token_ids.audio_pad
+            # Undelay all prefix frames at once and decode in one batch
+            prefix_tokens_delayed = audio_buf[0:1, :, :prefix_end].clone()
+            prefix_tokens_undelayed = undelay_frames(
+                prefix_tokens_delayed[0], delays, token_ids.audio_pad
+            ).unsqueeze(0)
+            
+            undelayed_prefix_len = prefix_tokens_undelayed.shape[-1]
+            if undelayed_prefix_len > 0:
+                # Decode all prefix frames in one call to build KV cache
+                _, mimi_kv = runtime.mimi.decode_streaming(
+                    prefix_tokens_undelayed, mimi_kv
                 )
-                _, mimi_kv = runtime.mimi.decode_streaming(undelayed_frame, mimi_kv)
-            t_warmup = time.perf_counter() - t_warmup_start
-            print(f"[streaming] Mimi warmup: {t_warmup*1000:.0f}ms ({undelayed_prefix_end} frames)")
+                t_warmup = time.perf_counter() - t_warmup_start
+                print(f"[streaming] Mimi warmup: {t_warmup*1000:.0f}ms ({undelayed_prefix_len} frames, batched)")
     
     first_frame_time = None
     first_audio_time = None
