@@ -306,6 +306,11 @@ def run_streaming_generation(
                 # Get the new frames (delayed tokens, no undelaying)
                 new_tokens = audio_buf[0:1, :, last_decode_pos:current_pos].clone()
                 
+                # Sanitize tokens for Mimi (replace special tokens like pad/bos/ungenerated with 0)
+                # Mimi expects [0, 2047].
+                new_tokens[new_tokens >= 2048] = 0
+                new_tokens[new_tokens < 0] = 0
+                
                 # Decode with Mimi streaming
                 pcm, mimi_kv = runtime.mimi.decode_streaming(new_tokens, mimi_kv)
                 

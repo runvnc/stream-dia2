@@ -258,6 +258,12 @@ def _create_voice_session(speaker_1_path: str, speaker_2_path: str) -> VoiceSess
     # But decode_streaming expects [B, C, T]
     # We only decode the first branch (main output) to match streaming generator
     prefix_tokens = gen_state.audio_buf[0:1, :, :prefix_len].clone()
+    
+    # Sanitize tokens for Mimi (replace special tokens like pad/bos with 0)
+    # Mimi expects [0, 2047]. Dia2 uses higher indices for special tokens.
+    prefix_tokens[prefix_tokens >= 2048] = 0
+    prefix_tokens[prefix_tokens < 0] = 0
+    
     _, mimi_kv = runtime.mimi.decode_streaming(prefix_tokens, None)
     print("[Dia2] Mimi decoder warmed up.")
     
