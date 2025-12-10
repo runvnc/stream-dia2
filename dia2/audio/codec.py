@@ -41,6 +41,7 @@ class MimiCodec(nn.Module):
             model_id,
             torch_dtype=dtype,
             low_cpu_mem_usage=True,
+            use_cache=True,
         )
         model = model.to(device)
         model.eval()
