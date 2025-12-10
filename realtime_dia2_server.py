@@ -222,7 +222,8 @@ class ContinuousSession:
             
             is_idle = (not state.entries and 
                        not state.pending_tokens and 
-                       (flush_target is None or self.current_step >= flush_target))
+                       state.end_step is not None and
+                       self.current_step >= flush_target)
             
             if is_idle:
                 # Flush remaining audio frames that didn't meet the chunk size
