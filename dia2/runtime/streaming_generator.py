@@ -275,21 +275,29 @@ def run_streaming_generation(
                 decode_start = output_start_frame
                 decode_end = current_frame
                 
+                t_decode_start = time.perf_counter()
                 all_tokens = audio_buf[0:1, :, decode_start:decode_end].clone()
+                t_clone = time.perf_counter()
                 
                 aligned = undelay_frames(
                     all_tokens[0],
                     runtime.audio_delays,
                     token_ids.audio_pad
                 ).unsqueeze(0)
+                t_undelay = time.perf_counter()
                 
                 if aligned.shape[-1] > 0:
                     pcm = runtime.mimi.decode(aligned)
                     full_waveform = torch.clamp(pcm[0, 0], -1.0, 1.0)
+                    t_mimi = time.perf_counter()
                     
                     if first_decode_time is None:
                         first_decode_time = time.perf_counter()
-                        print(f"[streaming] First decode: {(first_decode_time - t_loop_start)*1000:.0f}ms")
+                        print(f"[streaming] First decode: {(first_decode_time - t_loop_start)*1000:.0f}ms "
+                              f"(clone={t_clone-t_decode_start:.3f}s, "
+                              f"undelay={t_undelay-t_clone:.3f}s, "
+                              f"mimi={t_mimi-t_undelay:.3f}s, "
+                              f"frames={decode_end-decode_start})")
                     
                     total_samples = full_waveform.shape[0]
                     
