@@ -108,8 +108,15 @@ class Dia2Client:
             data = json.loads(msg)
             event = data.get("event")
             
-            if event == "voice_set":
-                print(f"[client] Voice set: speaker_1={data.get('speaker_1')}, speaker_2={data.get('speaker_2')}")
+            if event == "warming":
+                print(f"[client] {data.get('message', 'Warming up voice...')}")
+                continue
+            elif event == "voice_ready":
+                print(f"[client] Voice ready!")
+                break
+            elif event == "voice_set":
+                # Legacy event
+                print(f"[client] Voice set")
                 break
             elif event == "ping":
                 await self.ws.send(json.dumps({"type": "pong"}))
@@ -117,8 +124,6 @@ class Dia2Client:
             elif "error" in data:
                 print(f"[client] Error setting voice: {data['error']}")
                 break
-            else:
-                print(f"[client] Unexpected response: {data}")
     
     async def ensure_connected(self) -> None:
         """Ensure we're connected, reconnecting if necessary."""
