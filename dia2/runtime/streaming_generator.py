@@ -131,6 +131,9 @@ def run_streaming_generation(
     first_frame_time = None
     steps_completed = 0
     
+    t_loop_start = time.perf_counter()
+    graphs_were_cached = cached_graphs is not None and cached_graphs.transformer_capture is not None
+    
     with torch.inference_mode():
         for offset in range(max_context):
             t = start_step + offset
@@ -175,6 +178,10 @@ def run_streaming_generation(
                     cached_graphs.transformer_capture = transformer_capture
                     cached_graphs.dep_captures = dep_captures
                     cached_graphs.buffers = buffers
+            
+            if first_frame_time is None:
+                first_frame_time = time.perf_counter()
+                print(f"[streaming] First frame: {(first_frame_time - t_loop_start)*1000:.0f}ms (graphs_cached={graphs_were_cached})")
             
             guided_text = apply_classifier_guidance(
                 buffers.text, cfg_active, config.cfg_scale, config.cfg_filter_k
@@ -251,9 +258,6 @@ def run_streaming_generation(
                 prev_audio = stage_token.expand(branches)
             
             steps_completed += 1
-            
-            if first_frame_time is None:
-                first_frame_time = time.perf_counter()
             
             if eos_cutoff is None and state.end_step is not None:
                 eos_cutoff = state.end_step + flush_tail
