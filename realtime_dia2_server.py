@@ -246,7 +246,7 @@ def _create_voice_session(speaker_1_path: str, speaker_2_path: str) -> VoiceSess
     warmup_state = runtime.machine.new_state(prefix_plan.entries)
     
     # Run warmup
-    start_step = warmup_with_prefix(runtime, prefix_plan, warmup_state, gen_state)
+    last_prefix_step = warmup_with_prefix(runtime, prefix_plan, warmup_state, gen_state)
     
     # CRITICAL FIX: Clear any pending text tokens from the prefix state.
     # If the prefix alignment was tight, some text tokens might remain in pending_tokens.
@@ -277,6 +277,9 @@ def _create_voice_session(speaker_1_path: str, speaker_2_path: str) -> VoiceSess
     if mimi_kv is None: print("[Dia2] WARNING: Mimi KV cache is None after warmup!")
     print("[Dia2] Mimi decoder warmed up.")
     
+    # We want to start generating AFTER the prefix, so increment step
+    start_step = last_prefix_step + 1
+
     # Snapshot the state machine after warmup for fast restoration
     warmup_state_snapshot = copy.deepcopy(warmup_state)
     
