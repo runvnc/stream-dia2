@@ -197,6 +197,7 @@ class ContinuousSession:
         
         token_ids = runtime.constants
         delay_tensor = runtime.audio_delay_tensor
+        max_delay = int(delay_tensor.max().item()) if delay_tensor.numel() else 0
         
         # Streaming state
         chunk_frames = 3
@@ -213,7 +214,15 @@ class ContinuousSession:
             # B) We are busy -> Check if there is new input to append (non-blocking)
             
             new_item = None
-            is_idle = not state.entries and not state.pending_tokens
+            
+            # Determine if we are truly idle (including flushing the audio tail)
+            flush_target = None
+            if state.end_step is not None:
+                flush_target = state.end_step + max_delay + runtime.machine.max_padding
+            
+            is_idle = (not state.entries and 
+                       not state.pending_tokens and 
+                       (flush_target is None or self.current_step >= flush_target))
             
             if is_idle:
                 # Flush remaining audio frames that didn't meet the chunk size
@@ -254,6 +263,7 @@ class ContinuousSession:
                 item_type, item_data = new_item
                 if item_type == 'text':
                     state.entries.extend(item_data)
+                    state.end_step = None # Reset end_step so we continue generating
                     steps_since_input = 0
                     print(f"[Dia2] Processing text input ({len(item_data)} entries)")
                 elif item_type == 'audio':
