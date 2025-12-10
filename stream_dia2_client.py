@@ -62,47 +62,58 @@ async def stream_tts(
                     print(f"[client] Error setting voice: {data['error']}")
                     return
 
-        # 3. Send TTS request
-        async def listen_for_input():
-            loop = asyncio.get_event_loop()
-            while True:
-                line = await loop.run_in_executor(None, sys.stdin.readline)
-                if not line:
-                    break
-                line = line.strip()
-                if not line: continue
-                
-                if line.startswith("!append "):
-                    parts = line.split(" ", 1)
-                    if len(parts) > 1:
-                        path = parts[1]
-                        try:
-                            with open(path, "rb") as f:
-                                audio_b64 = base64.b64encode(f.read()).decode("utf-8")
-                            print(f"[client] Appending audio from {path}...")
-                            await ws.send(json.dumps({
-                                "type": "append_audio",
-                                "audio": audio_b64,
-                                "speaker": "speaker_2" # Assume user
-                            }))
-                        except Exception as e:
-                            print(f"[client] Error reading file: {e}")
-                    continue
-                
-                # Normal TTS
-                await ws.send(json.dumps({
-                    "type": "tts",
-                    "text": line,
-                    "chunk_frames": 1,
-                    "continue_session": True
-                }))
+        # 3. Start Input Listener if interactive
+        if interactive:
+            print("[client] Interactive mode. Type text to speak, or !append <file.wav> to add context.")
+            
+            async def listen_for_input():
+                loop = asyncio.get_event_loop()
+                while True:
+                    try:
+                        line = await loop.run_in_executor(None, sys.stdin.readline)
+                        if not line:
+                            break
+                        line = line.strip()
+                        if not line: continue
+                        
+                        if line.startswith("!append "):
+                            parts = line.split(" ", 1)
+                            if len(parts) > 1:
+                                path = parts[1]
+                                try:
+                                    with open(path, "rb") as f:
+                                        audio_b64 = base64.b64encode(f.read()).decode("utf-8")
+                                    print(f"[client] Appending audio from {path}...")
+                                    await ws.send(json.dumps({
+                                        "type": "append_audio",
+                                        "audio": audio_b64,
+                                        "speaker": "speaker_2" # Assume user
+                                    }))
+                                except Exception as e:
+                                    print(f"[client] Error reading file: {e}")
+                            continue
+                        
+                        # Normal TTS
+                        await ws.send(json.dumps({
+                            "type": "tts",
+                            "text": line,
+                            "chunk_frames": 1,
+                            "continue_session": True
+                        }))
+                    except Exception as e:
+                        print(f"[client] Input error: {e}")
+                        break
+            
+            asyncio.create_task(listen_for_input())
 
+        # 4. Send initial TTS request if provided
         if text:
             print(f"[client] Sending TTS request: {text[:50]}...")
             await ws.send(json.dumps({
                 "type": "tts",
                 "text": text,
-                "chunk_frames": 1  # Low latency
+                "chunk_frames": 1,
+                "continue_session": interactive # If interactive, we want to keep context
             }))
 
         sample_rate = None
@@ -110,46 +121,50 @@ async def stream_tts(
 
         try:
             while True:
-                msg = await ws.recv()
+                try:
+                    msg = await ws.recv()
+                except websockets.exceptions.ConnectionClosed:
+                    print("[client] Connection closed.")
+                    break
 
                 # Text frame
                 if isinstance(msg, str):
-                    # Ignore pings
-                    if "ping" in msg: 
-                        continue
+                    if "ping" in msg: continue
                         
                     data = json.loads(msg)
                     if data.get("event") == "config":
-                        sample_rate = int(data["sample_rate"])
-                        # print(f"[client] Server sample_rate = {sample_rate}")
+                        # Legacy/unused in this version but kept for compat
+                        pass
 
-                        # Open an output stream; let sounddevice pick device
-                        stream = sd.OutputStream(
-                            samplerate=sample_rate,
-                            channels=1,
-                            dtype="float32",
-                        )
-                        stream.start()
+                    elif data.get("event") == "ready":
+                        if "sample_rate" in data:
+                            sample_rate = int(data["sample_rate"])
+                            if stream is None:
+                                stream = sd.OutputStream(
+                                    samplerate=sample_rate,
+                                    channels=1,
+                                    dtype="float32",
+                                )
+                                stream.start()
+                        continue
 
                     elif data.get("event") == "done":
-                        print("[client] Stream done.")
-                        break
-                    elif data.get("event") == "ready":
+                        print("[client] Generation done.")
+                        if not interactive:
+                            break
                         continue
+                        
                     elif data.get("event") == "appended":
                         print(f"[client] Audio appended. New step: {data.get('new_step')}")
-                        # Handled at start, but just in case
                         continue
+                        
                     elif "error" in data:
                         print("[client] Error from server:", data["error"])
-                        break
+                        if not interactive:
+                            break
                     continue
 
                 # Binary frame: [is_last:1 byte][pcm16...]
-                if sample_rate is None:
-                    print("[client] Received audio before config; ignoring frame.")
-                    continue
-
                 if len(msg) < 1:
                     continue
 
@@ -157,12 +172,23 @@ async def stream_tts(
                 pcm16_bytes = msg[1:]
                 audio = pcm16_to_float(pcm16_bytes)
 
+                if stream is None:
+                    # Fallback if ready event missed or not sent yet (shouldn't happen with correct protocol)
+                    # Default to 24k or wait?
+                    # Let's assume 24000 if not set, or print warning
+                    if sample_rate is None:
+                         sample_rate = 24000
+                         stream = sd.OutputStream(samplerate=sample_rate, channels=1, dtype="float32")
+                         stream.start()
+
                 if stream is not None and audio.size > 0:
                     stream.write(audio)
 
                 if is_last:
-                    print("[client] Received last chunk.")
-                    break
+                    # In interactive mode, is_last just means this utterance is done.
+                    # We don't break the loop.
+                    pass
+                    
         finally:
             if stream is not None:
                 stream.stop()
@@ -188,7 +214,6 @@ def main():
             parser.print_help()
             sys.exit(1)
         text = sys.stdin.read().strip() if not sys.stdin.isatty() else "[S1] Hello world."
-        if args.interactive: text = None
     else:
         text = args.text
 
@@ -199,7 +224,6 @@ def main():
             interactive=args.interactive,
             prefix_speaker_1=args.prefix_speaker_1,
             prefix_speaker_2=args.prefix_speaker_2,
-            include_prefix=False,
             include_prefix=args.include_prefix,
         )
     )
