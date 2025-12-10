@@ -293,10 +293,10 @@ def _warmup_model() -> None:
     """Warm up the model with a simple generation."""
     try:
         cfg = GenerationConfig(
-            cfg_scale=2.0,
+            cfg_scale=1.0,
             text=SamplingConfig(temperature=0.6, top_k=50),
             audio=SamplingConfig(temperature=0.8, top_k=50),
-            use_cuda_graph=False,
+            use_cuda_graph=True,
         )
         print("[Dia2] Running warm-up generation...")
         _ = dia.generate("[S1] Warm up.", config=cfg, output_wav=None, verbose=False)

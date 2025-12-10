@@ -14,7 +14,7 @@ import websockets
 WS_MAX_SIZE = 16 * 1024 * 1024
 
 # Default CFG scale (1.0 = no guidance, higher = stronger voice matching)
-DEFAULT_CFG_SCALE = 3.0
+DEFAULT_CFG_SCALE = 1.0
 DEFAULT_TEMPERATURE = 0.8
 
 
@@ -29,14 +29,14 @@ def pcm16_to_float(pcm: bytes) -> np.ndarray:
 def load_audio_as_base64(path: str) -> tuple[str, str]:
     """Load audio file and return (base64_data, format_suffix)."""
     p = Path(path)
-    suffix = p.suffix.lower()  # e.g., ".mp3", ".wav"
+    suffix = p.suffix.lower()
     with open(path, "rb") as f:
         data = f.read()
     return base64.b64encode(data).decode("utf-8"), suffix
 
 
 class Dia2Client:
-    """Persistent WebSocket client for Dia2 TTS."""
+    """Persistent WebSocket client for Dia2 TTS with auto-reconnect."""
     
     def __init__(self, ws_url: str = "ws://localhost:8000/ws/stream_tts"):
         self.ws_url = ws_url
@@ -45,6 +45,10 @@ class Dia2Client:
         self.stream: Optional[sd.OutputStream] = None
         self.cfg_scale: float = DEFAULT_CFG_SCALE
         self.temperature: float = DEFAULT_TEMPERATURE
+        # For auto-reconnect
+        self._speaker_1_path: Optional[str] = None
+        self._speaker_2_path: Optional[str] = None
+        self._connected: bool = False
     
     async def connect(self) -> None:
         """Connect to the server."""
@@ -61,11 +65,11 @@ class Dia2Client:
                 print(f"[client] Connected, sample_rate={self.sample_rate}")
                 break
             elif event == "ping":
-                # Respond to ping and keep waiting for ready
                 await self.ws.send(json.dumps({"type": "pong"}))
                 continue
             else:
                 raise RuntimeError(f"Unexpected response while connecting: {data}")
+        self._connected = True
     
     async def set_voice(
         self,
@@ -75,6 +79,12 @@ class Dia2Client:
         """Set voice conditioning audio for speakers."""
         if not self.ws:
             raise RuntimeError("Not connected")
+        
+        # Store paths for reconnection
+        if speaker_1_path:
+            self._speaker_1_path = speaker_1_path
+        if speaker_2_path:
+            self._speaker_2_path = speaker_2_path
         
         payload: dict = {"type": "set_voice"}
         
@@ -110,6 +120,26 @@ class Dia2Client:
             else:
                 print(f"[client] Unexpected response: {data}")
     
+    async def ensure_connected(self) -> None:
+        """Ensure we're connected, reconnecting if necessary."""
+        if self.ws and self._connected:
+            try:
+                await self.ws.ping()
+                return
+            except:
+                pass
+        
+        print("[client] Reconnecting...")
+        self._connected = False
+        try:
+            await self.connect()
+            if self._speaker_1_path or self._speaker_2_path:
+                print("[client] Restoring voice settings...")
+                await self.set_voice(self._speaker_1_path, self._speaker_2_path)
+        except Exception as e:
+            print(f"[client] Reconnection failed: {e}")
+            raise
+    
     async def speak(
         self,
         text: str,
@@ -118,8 +148,7 @@ class Dia2Client:
         cfg_scale: Optional[float] = None,
     ) -> None:
         """Generate and play TTS for the given text."""
-        if not self.ws:
-            raise RuntimeError("Not connected")
+        await self.ensure_connected()
         
         payload = {
             "type": "tts",
@@ -129,7 +158,12 @@ class Dia2Client:
             "cfg_scale": cfg_scale if cfg_scale is not None else self.cfg_scale,
         }
         
-        await self.ws.send(json.dumps(payload))
+        try:
+            await self.ws.send(json.dumps(payload))
+        except websockets.exceptions.ConnectionClosed:
+            print("[client] Connection lost, reconnecting...")
+            await self.ensure_connected()
+            await self.ws.send(json.dumps(payload))
         
         # Start audio stream
         self.stream = sd.OutputStream(
@@ -143,7 +177,12 @@ class Dia2Client:
         
         try:
             while True:
-                msg = await self.ws.recv()
+                try:
+                    msg = await self.ws.recv()
+                except websockets.exceptions.ConnectionClosed:
+                    print("[client] Connection lost during streaming")
+                    self._connected = False
+                    break
                 
                 if isinstance(msg, str):
                     data = json.loads(msg)
@@ -153,14 +192,12 @@ class Dia2Client:
                         print(f"[client] Done, received {chunks_received} chunks (server reported {data.get('chunks', '?')})")
                         break
                     elif event == "ping":
-                        # Respond to ping during streaming
                         await self.ws.send(json.dumps({"type": "pong"}))
                         continue
                     elif "error" in data:
                         print(f"[client] Error: {data['error']}")
                         break
                     else:
-                        # Unknown text message, ignore and continue
                         print(f"[client] Ignoring message: {data}")
                         continue
                 
@@ -175,12 +212,8 @@ class Dia2Client:
                 if audio.size > 0:
                     self.stream.write(audio)
                     chunks_received += 1
-                
-                # NOTE: Do NOT break on is_last! Wait for the "done" event.
-                # Breaking here causes message desync on subsequent requests.
         finally:
             if self.stream:
-                # Give time for audio to finish playing
                 await asyncio.sleep(0.5)
                 self.stream.stop()
                 self.stream.close()
@@ -189,6 +222,7 @@ class Dia2Client:
     async def close(self) -> None:
         """Close the connection."""
         if self.ws:
+            self._connected = False
             try:
                 await self.ws.send(json.dumps({"type": "close"}))
             except:
@@ -214,7 +248,6 @@ async def interactive_mode(
     client.temperature = temperature
     await client.connect()
     
-    # Set voice if provided
     if speaker_1_path or speaker_2_path:
         await client.set_voice(speaker_1_path, speaker_2_path)
     
@@ -242,7 +275,6 @@ async def interactive_mode(
             if not user_input:
                 continue
             
-            # Commands
             if user_input.lower() in ("/quit", "/q", "quit", "exit"):
                 break
             
