@@ -163,7 +163,7 @@ def run_streaming_generation(
     samples_skipped = 0
     
     # Track decode position - we decode from start_step onwards
-    last_decode_pos = start_step
+    last_decode_pos = start_step + 1
     
     with torch.inference_mode():
         for offset in range(max_context):
