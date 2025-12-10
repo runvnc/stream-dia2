@@ -1,8 +1,9 @@
-"""Dia2 TTS Server with persistent WebSocket connections and voice conditioning.
+"""Dia2 TTS Server with TRUE streaming - yields audio chunks during generation.
 
-This version uses the standard dia2.generate() for reliability, then streams
-the result in chunks. Voice samples are cached to avoid re-transcription
-and re-encoding.
+This version uses run_streaming_generation() to yield audio chunks as they're
+generated, rather than waiting for full generation to complete.
+
+Voice samples are cached to avoid re-transcription and re-encoding.
 """
 import asyncio
 import base64
@@ -13,6 +14,7 @@ import os
 import hashlib
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from queue import Queue, Empty
 import time
 from typing import Optional, List, Dict, Any
 
@@ -26,8 +28,10 @@ from dia2.runtime import voice_clone
 from dia2 import engine as dia2_engine
 from dia2.runtime.voice_clone import WhisperWord, build_prefix_plan, PrefixPlan
 from dia2.runtime.audio_io import load_mono_audio, encode_audio_tokens
-from dia2.generation import PrefixConfig
-from dia2.runtime.voice_clone import WhisperWord
+from dia2.generation import PrefixConfig, normalize_script
+from dia2.runtime.generator import build_initial_state, warmup_with_prefix
+from dia2.runtime.streaming_generator import run_streaming_generation, StreamingChunk
+from dia2.runtime.script_parser import parse_script
 
 
 app = FastAPI()
@@ -116,7 +120,6 @@ def _cached_load_audio(audio_path: str, sample_rate: int) -> np.ndarray:
     file_hash = _hash_file(audio_path)
     
     # Store path for the encode function to use
-    print(f"[Dia2] DEBUG _cached_load_audio: path={os.path.basename(audio_path)}, hash={file_hash[:16]}...")
     _current_encoding_path = audio_path
     
     if file_hash in _audio_data_cache:
@@ -138,7 +141,6 @@ def _cached_encode_audio(mimi, audio: np.ndarray) -> torch.Tensor:
     global _current_encoding_path
     
     if _current_encoding_path:
-        print(f"[Dia2] DEBUG _cached_encode_audio: current_path={os.path.basename(_current_encoding_path)}")
         file_hash = _hash_file(_current_encoding_path)
         if file_hash in _audio_token_cache:
             print(f"[Dia2] Using cached audio tokens")
@@ -152,7 +154,6 @@ def _cached_encode_audio(mimi, audio: np.ndarray) -> torch.Tensor:
     
     if _current_encoding_path:
         file_hash = _hash_file(_current_encoding_path)
-        print(f"[Dia2] DEBUG: Caching audio tokens with hash={file_hash[:16]}..., shape={tokens.shape}")
         _audio_token_cache[file_hash] = tokens
     
     return tokens
@@ -166,21 +167,6 @@ def _cached_build_prefix_plan(runtime, prefix: Optional[PrefixConfig], **kwargs)
     if prefix is None:
         return None
     
-    # Debug: Check speaker token mapping
-    convert = getattr(runtime.tokenizer, "convert_tokens_to_ids", None)
-    if callable(convert):
-        s1_id = convert("[S1]")
-        s2_id = convert("[S2]")
-        print(f"[Dia2] DEBUG: Token IDs - [S1]={s1_id}, [S2]={s2_id}")
-        print(f"[Dia2] DEBUG: Constants - spk1={runtime.constants.spk1}, spk2={runtime.constants.spk2}")
-        if s1_id != runtime.constants.spk1:
-            print(f"[Dia2] WARNING: [S1] token ID mismatch! {s1_id} != {runtime.constants.spk1}")
-        if s2_id != runtime.constants.spk2:
-            print(f"[Dia2] WARNING: [S2] token ID mismatch! {s2_id} != {runtime.constants.spk2}")
-    
-    # Debug: Show prefix config
-    print(f"[Dia2] DEBUG: PrefixConfig - speaker_1={prefix.speaker_1}, speaker_2={prefix.speaker_2}")
-    
     # Create encode function that uses our cache
     def cached_encode_fn(audio: np.ndarray) -> torch.Tensor:
         return _cached_encode_audio(runtime.mimi, audio)
@@ -193,44 +179,6 @@ def _cached_build_prefix_plan(runtime, prefix: Optional[PrefixConfig], **kwargs)
         encode_fn=cached_encode_fn,
         **kwargs
     )
-    
-    # Debug: Show what entries were created
-    if result:
-        print(f"[Dia2] DEBUG: PrefixPlan has {len(result.entries)} entries, {result.aligned_frames} frames")
-        # Show first 3 entries (should be S1)
-        for i, entry in enumerate(result.entries[:3]):
-            print(f"[Dia2] DEBUG:   S1 Entry {i}: tokens={entry.tokens[:5]}... text='{entry.text}'")
-        # Find where S2 starts (look for token 49153)
-        s2_start = None
-        for i, entry in enumerate(result.entries):
-            if entry.tokens and entry.tokens[0] == 49153:  # S2 token
-                s2_start = i
-                break
-        if s2_start:
-            for i, entry in enumerate(result.entries[s2_start:s2_start+3]):
-                print(f"[Dia2] DEBUG:   S2 Entry {s2_start+i}: tokens={entry.tokens[:5]}... text='{entry.text}'")
-    
-    # Debug: Check audio token shapes
-    if result:
-        print(f"[Dia2] DEBUG: aligned_tokens shape={result.aligned_tokens.shape}")
-        # Show first few values of audio tokens to verify they're different
-        if result.aligned_tokens.shape[1] > 0:
-            s1_sample = result.aligned_tokens[0, :3].tolist() if result.aligned_tokens.shape[1] >= 3 else result.aligned_tokens[0, :].tolist()
-            print(f"[Dia2] DEBUG: S1 audio tokens (first 3 frames, ch0): {s1_sample}")
-        if result.aligned_tokens.shape[1] > 200:  # S2 starts after S1
-            s2_sample = result.aligned_tokens[0, -3:].tolist()
-            print(f"[Dia2] DEBUG: S2 audio tokens (last 3 frames, ch0): {s2_sample}")
-    
-    # Debug: Check new_word_steps
-    if result:
-        print(f"[Dia2] DEBUG: new_word_steps count={len(result.new_word_steps)}")
-        if result.new_word_steps:
-            # Show first few (S1) and last few (S2) word steps
-            s1_steps = result.new_word_steps[:3]
-            s2_steps = result.new_word_steps[-3:] if len(result.new_word_steps) > 3 else []
-            print(f"[Dia2] DEBUG: S1 word steps (first 3): {s1_steps}")
-            print(f"[Dia2] DEBUG: S2 word steps (last 3): {s2_steps}")
-            print(f"[Dia2] DEBUG: aligned_frames={result.aligned_frames}, so S2 steps should be > ~{result.aligned_frames // 2}")
     
     return result
 
@@ -319,36 +267,15 @@ class AudioChunk:
     is_last: bool
 
 
-def waveform_to_pcm16_chunks(
-    waveform: torch.Tensor,
-    sample_rate: int,
-    chunk_ms: int = 100,
-) -> List[AudioChunk]:
-    """Convert waveform to PCM16 chunks."""
+def waveform_to_pcm16(waveform: torch.Tensor) -> bytes:
+    """Convert waveform tensor to PCM16 bytes."""
     if waveform.ndim != 1:
         waveform = waveform.view(-1)
     
     wav_np = waveform.detach().cpu().numpy().astype(np.float32)
     wav_np = np.clip(wav_np, -1.0, 1.0)
     pcm16 = (wav_np * 32767.0).astype(np.int16)
-    
-    samples_per_chunk = int(sample_rate * chunk_ms / 1000)
-    num_samples = len(pcm16)
-    
-    chunks = []
-    for start in range(0, num_samples, samples_per_chunk):
-        end = min(start + samples_per_chunk, num_samples)
-        piece = pcm16[start:end]
-        chunks.append(AudioChunk(
-            pcm16=piece.tobytes(),
-            sample_rate=sample_rate,
-            is_last=(end >= num_samples),
-        ))
-    
-    if not chunks:
-        chunks.append(AudioChunk(pcm16=b"", sample_rate=sample_rate, is_last=True))
-    
-    return chunks
+    return pcm16.tobytes()
 
 
 def save_audio_from_base64(audio_b64: str, suffix: str = ".wav") -> str:
@@ -361,55 +288,114 @@ def save_audio_from_base64(audio_b64: str, suffix: str = ".wav") -> str:
 
 
 # ============================================================================
-# TTS Generation
+# Streaming TTS Generation
 # ============================================================================
 
-def _generate_tts(
+def _run_streaming_generation(
     text: str,
+    output_queue: Queue,
     prefix_speaker_1: Optional[str] = None,
     prefix_speaker_2: Optional[str] = None,
     include_prefix: bool = False,
-    cfg_scale: float = 6.0,
+    cfg_scale: float = 1.0,
     temperature: float = 0.8,
     top_k: int = 50,
-    use_cuda_graph: bool = False,  # Disabled by default like CLI
-) -> List[AudioChunk]:
-    """Generate TTS using dia2.generate() and return chunks."""
-    t_start = time.perf_counter()
-    print(f"[Dia2] Generating: {text[:80]}...")
-    print(f"[Dia2] DEBUG _generate_tts: prefix_speaker_1={prefix_speaker_1}")
-    print(f"[Dia2] DEBUG _generate_tts: prefix_speaker_2={prefix_speaker_2}")
-    print(f"[Dia2] DEBUG _generate_tts: cfg_scale={cfg_scale}, temp={temperature}, cuda_graph={use_cuda_graph}")
-    
-    # Use same temperature for both text and audio (like CLI does)
-    sampling = SamplingConfig(temperature=temperature, top_k=top_k)
-    cfg = GenerationConfig(
-        cfg_scale=cfg_scale,
-        text=sampling,
-        audio=sampling,
-        use_cuda_graph=use_cuda_graph,
-    )
-    
-    t_before_gen = time.perf_counter()
-    result = dia.generate(
-        text,
-        config=cfg,
-        output_wav=None,
-        prefix_speaker_1=prefix_speaker_1,
-        prefix_speaker_2=prefix_speaker_2,
-        include_prefix=include_prefix,
-        verbose=False,
-    )
-    t_after_gen = time.perf_counter()
-    
-    chunks = waveform_to_pcm16_chunks(result.waveform, result.sample_rate, chunk_ms=100)
-    t_end = time.perf_counter()
-    
-    print(f"[Dia2] Timing: setup={t_before_gen-t_start:.2f}s, "
-          f"generate={t_after_gen-t_before_gen:.2f}s, "
-          f"chunk={t_end-t_after_gen:.2f}s, total={t_end-t_start:.2f}s")
-    print(f"[Dia2] Generated {len(chunks)} chunks ({result.waveform.shape[-1]/result.sample_rate:.2f}s audio)")
-    return chunks
+    use_cuda_graph: bool = False,
+    chunk_frames: int = 12,  # ~1 second at 12.5 Hz
+) -> None:
+    """Run streaming generation and put chunks into the queue."""
+    try:
+        t_start = time.perf_counter()
+        print(f"[Dia2] Streaming: {text[:80]}...")
+        print(f"[Dia2] cfg_scale={cfg_scale}, temp={temperature}, chunk_frames={chunk_frames}")
+        
+        runtime = dia._ensure_runtime()
+        
+        # Use same temperature for both text and audio (like CLI)
+        sampling = SamplingConfig(temperature=temperature, top_k=top_k)
+        base_config = GenerationConfig(
+            cfg_scale=cfg_scale,
+            text=sampling,
+            audio=sampling,
+            use_cuda_graph=use_cuda_graph,
+        )
+        
+        # Build prefix plan if voice samples provided
+        prefix_plan = None
+        if prefix_speaker_1 or prefix_speaker_2:
+            prefix_config = PrefixConfig(
+                speaker_1=prefix_speaker_1,
+                speaker_2=prefix_speaker_2,
+            )
+            prefix_plan = _cached_build_prefix_plan(runtime, prefix_config)
+        
+        # Normalize and parse the script
+        normalized_text = normalize_script(text)
+        
+        # Build entries list
+        entries = []
+        if prefix_plan is not None:
+            entries.extend(prefix_plan.entries)
+        entries.extend(parse_script(
+            [normalized_text],
+            runtime.tokenizer,
+            runtime.constants,
+            runtime.frame_rate
+        ))
+        
+        # Set up state machine
+        runtime.machine.initial_padding = base_config.initial_padding
+        state = runtime.machine.new_state(entries)
+        
+        # Build generation state
+        gen_state = build_initial_state(runtime, prefix=prefix_plan)
+        
+        # Warmup with prefix if needed
+        start_step = 0
+        if prefix_plan is not None:
+            start_step = warmup_with_prefix(runtime, prefix_plan, state, gen_state)
+            print(f"[Dia2] Prefix warmup done, start_step={start_step}")
+        
+        include_prefix_audio = include_prefix
+        
+        t_setup = time.perf_counter()
+        print(f"[Dia2] Setup took {t_setup - t_start:.2f}s")
+        
+        # Run streaming generation
+        chunk_count = 0
+        total_samples = 0
+        for chunk in run_streaming_generation(
+            runtime,
+            state=state,
+            generation=gen_state,
+            config=base_config,
+            start_step=start_step,
+            chunk_frames=chunk_frames,
+            include_prefix_audio=include_prefix_audio,
+        ):
+            chunk_count += 1
+            pcm16_bytes = waveform_to_pcm16(chunk.waveform)
+            total_samples += chunk.waveform.shape[0]
+            
+            output_queue.put(AudioChunk(
+                pcm16=pcm16_bytes,
+                sample_rate=chunk.sample_rate,
+                is_last=chunk.is_final,
+            ))
+            
+            if chunk.is_final:
+                break
+        
+        t_end = time.perf_counter()
+        duration = total_samples / runtime.mimi.sample_rate if total_samples > 0 else 0
+        print(f"[Dia2] Done: {chunk_count} chunks, {duration:.2f}s audio in {t_end - t_start:.2f}s")
+                
+    except Exception as e:
+        print(f"[Dia2] Generation error: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        output_queue.put(None)  # Signal completion
 
 
 # ============================================================================
@@ -418,14 +404,14 @@ def _generate_tts(
 
 @app.websocket("/ws/stream_tts")
 async def stream_tts(ws: WebSocket):
-    """WebSocket endpoint with persistent connection.
+    """WebSocket endpoint with persistent connection and TRUE streaming.
     
     Protocol:
     1. Connect -> Server sends {"event": "ready", "sample_rate": 24000}
     2. Set voice: {"type": "set_voice", "speaker_1": "<base64>", "format_1": ".mp3"}
        Response: {"event": "voice_set", "speaker_1": true, "speaker_2": false}
     3. TTS: {"type": "tts", "text": "[S1] Hello!"}
-       Response: Binary audio chunks, then {"event": "done"}
+       Response: Binary audio chunks streamed AS THEY'RE GENERATED, then {"event": "done"}
     4. Close: {"type": "close"}
     """
     await ws.accept()
@@ -533,35 +519,64 @@ async def stream_tts(ws: WebSocket):
                     await ws.send_text(json.dumps({"error": "Missing 'text'"}))
                     continue
                 
-                loop = asyncio.get_running_loop()
-                try:
-                    chunks = await loop.run_in_executor(
-                        _cuda_executor,
-                        lambda: _generate_tts(
-                            text=text,
-                            prefix_speaker_1=prefix_speaker_1,
-                            prefix_speaker_2=prefix_speaker_2,
-                            include_prefix=bool(payload.get("include_prefix", False)),
-                            cfg_scale=float(payload.get("cfg_scale", 6.0)),
-                            temperature=float(payload.get("temperature", 0.8)),
-                            top_k=int(payload.get("top_k", 50)),
-                            use_cuda_graph=bool(payload.get("use_cuda_graph", False)),
-                        )
-                    )
-                except Exception as e:
-                    print(f"[Dia2] Generation error: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    await ws.send_text(json.dumps({"error": str(e)}))
-                    continue
+                chunk_queue: Queue = Queue()
                 
-                # Stream chunks
-                for chunk in chunks:
+                loop = asyncio.get_running_loop()
+                gen_future = loop.run_in_executor(
+                    _cuda_executor,
+                    lambda: _run_streaming_generation(
+                        text=text,
+                        output_queue=chunk_queue,
+                        prefix_speaker_1=prefix_speaker_1,
+                        prefix_speaker_2=prefix_speaker_2,
+                        include_prefix=bool(payload.get("include_prefix", False)),
+                        cfg_scale=float(payload.get("cfg_scale", 1.0)),
+                        temperature=float(payload.get("temperature", 0.8)),
+                        top_k=int(payload.get("top_k", 50)),
+                        use_cuda_graph=bool(payload.get("use_cuda_graph", False)),
+                        chunk_frames=int(payload.get("chunk_frames", 12)),
+                    )
+                )
+                
+                # Stream chunks as they arrive
+                chunks_sent = 0
+                while True:
+                    try:
+                        # Poll queue with timeout
+                        chunk = await loop.run_in_executor(
+                            None,
+                            lambda: chunk_queue.get(timeout=0.05)
+                        )
+                    except Empty:
+                        # Check if generation is done
+                        if gen_future.done():
+                            # Drain any remaining chunks
+                            while True:
+                                try:
+                                    chunk = chunk_queue.get_nowait()
+                                    if chunk is None:
+                                        break
+                                    header = struct.pack("!?", chunk.is_last)
+                                    await ws.send_bytes(header + chunk.pcm16)
+                                    chunks_sent += 1
+                                except Empty:
+                                    break
+                            break
+                        continue
+                    
+                    if chunk is None:
+                        break
+                    
+                    # Send chunk immediately
                     header = struct.pack("!?", chunk.is_last)
                     await ws.send_bytes(header + chunk.pcm16)
+                    chunks_sent += 1
+                    
+                    if chunk.is_last:
+                        break
                 
-                await ws.send_text(json.dumps({"event": "done", "chunks": len(chunks)}))
-                print(f"[Dia2] Sent {len(chunks)} chunks")
+                await ws.send_text(json.dumps({"event": "done", "chunks": chunks_sent}))
+                print(f"[Dia2] Sent {chunks_sent} chunks")
                 continue
             
             await ws.send_text(json.dumps({"error": f"Unknown type: {msg_type}"}))
