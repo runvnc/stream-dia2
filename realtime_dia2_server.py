@@ -559,7 +559,7 @@ async def stream_tts(ws: WebSocket):
                         cfg_scale=float(payload.get("cfg_scale", 1.0)),
                         temperature=float(payload.get("temperature", 0.8)),
                         top_k=int(payload.get("top_k", 50)),
-                        chunk_frames=int(payload.get("chunk_frames", 12)),
+                        chunk_frames=int(payload.get("chunk_frames", 1)),
                     )
                 )
                 
