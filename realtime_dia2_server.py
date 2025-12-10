@@ -336,7 +336,6 @@ def _run_streaming_tts(
     cfg_scale: float = 1.0,
     temperature: float = 0.8,
     top_k: int = 50,
-    chunk_frames: int = 1,  # Send every frame immediately
     chunk_frames: int = 1,
     prefix_samples_to_skip: int = 0,
 ) -> None:
