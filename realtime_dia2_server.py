@@ -201,74 +201,95 @@ class ContinuousSession:
         # Streaming state
         chunk_frames = 3
         last_decode_pos = self.current_step
+        sent_done = False
         
         print("[Dia2] Starting continuous generation loop...")
         
         while not self.stop_event.is_set():
             # 1. Check for new input if we are idle
-            if not state.entries and not state.pending_tokens:
+            # We check for input in two cases:
+            # A) We are idle (no entries, no pending tokens) -> Block and wait for input
+            # B) We are busy -> Check if there is new input to append (non-blocking)
+            
+            new_item = None
+            is_idle = not state.entries and not state.pending_tokens
+            
+            if is_idle:
+                if not sent_done:
+                    await websocket.send_text(json.dumps({"event": "done"}))
+                    sent_done = True
+                    print("[Dia2] Idle. Waiting for input...")
+                
                 try:
-                    item_type, item_data = await self.input_queue.get()
-                    if item_type == 'text':
-                        state.entries.extend(item_data)
-                        print(f"[Dia2] Processing text input ({len(item_data)} entries)")
-                    elif item_type == 'audio':
-                        # Process audio insertion immediately
-                        plan = item_data
-                        print(f"[Dia2] Processing audio input ({plan.aligned_frames} frames)")
-                        
-                        # We need to run the transformer for these frames to update state/history
-                        # but we force the audio tokens from the plan
-                        tokens = plan.aligned_tokens.to(runtime.device)
-                        new_word_steps = set(plan.new_word_steps)
-                        
-                        for i in range(plan.aligned_frames):
-                            t = self.current_step
-                            positions.fill_(t)
-                            
-                            # Fill step_tokens from plan (delayed)
-                            channels = tokens.shape[0]
-                            for cb in range(channels):
-                                delay = runtime.audio_delays[cb] if cb < len(runtime.audio_delays) else 0
-                                idx = i - delay
-                                value = tokens[cb, idx] if idx >= 0 else runtime.constants.audio_bos
-                                step_tokens[:, 2 + cb, 0] = value
-                            
-                            # Forward pass to update KV cache
-                            # We can't use the graph here easily because it's a different mode (forcing)
-                            # So we use the eager step function
-                            hidden_t = _execute_transformer_step(step_tokens, positions.expand(branches, -1), generation, runtime.transformer_step, buffers)
-                            
-                            # Update state machine (force words)
-                            forced = runtime.constants.new_word if i in new_word_steps else runtime.constants.pad
-                            main_token, aux_token, _ = runtime.machine.process(t, state, forced, is_forced=True)
-                            
-                            # Update audio buffer
-                            generation.audio_buf[:, :, t] = step_tokens[:, :, 0]
-                            
-                            self.current_step += 1
-                        
-                        # Clear any pending tokens from this audio so they aren't generated
-                        state.pending_tokens.clear()
-                        state.lookahead_tokens.clear()
-                        state.entries.clear()
-                        state.forced_padding = 0
-                        
-                        # Update decode pos so we don't try to decode this inserted audio
-                        last_decode_pos = self.current_step
-                        
-                        # Update Mimi KV by decoding the inserted audio (silently)
-                        # This keeps the decoder in sync
-                        new_tokens = generation.audio_buf[0:1, :, self.current_step-plan.aligned_frames:self.current_step].clone()
-                        new_tokens[new_tokens >= 2048] = 0
-                        new_tokens[new_tokens < 0] = 0
-                        _, self.mimi_kv = runtime.mimi.decode_streaming(new_tokens, self.mimi_kv)
-                        self.cached_graphs.mimi_kv = self.mimi_kv
-                        
-                        continue
-                        
+                    new_item = await self.input_queue.get()
+                    sent_done = False
                 except asyncio.CancelledError:
                     break
+            else:
+                try:
+                    new_item = self.input_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+            
+            if new_item:
+                item_type, item_data = new_item
+                if item_type == 'text':
+                    state.entries.extend(item_data)
+                    print(f"[Dia2] Processing text input ({len(item_data)} entries)")
+                elif item_type == 'audio':
+                    # Process audio insertion immediately
+                    plan = item_data
+                    print(f"[Dia2] Processing audio input ({plan.aligned_frames} frames)")
+                    
+                    # We need to run the transformer for these frames to update state/history
+                    # but we force the audio tokens from the plan
+                    tokens = plan.aligned_tokens.to(runtime.device)
+                    new_word_steps = set(plan.new_word_steps)
+                    
+                    for i in range(plan.aligned_frames):
+                        t = self.current_step
+                        positions.fill_(t)
+                        
+                        # Fill step_tokens from plan (delayed)
+                        channels = tokens.shape[0]
+                        for cb in range(channels):
+                            delay = runtime.audio_delays[cb] if cb < len(runtime.audio_delays) else 0
+                            idx = i - delay
+                            value = tokens[cb, idx] if idx >= 0 else runtime.constants.audio_bos
+                            step_tokens[:, 2 + cb, 0] = value
+                        
+                        # Forward pass to update KV cache
+                        # We can't use the graph here easily because it's a different mode (forcing)
+                        # So we use the eager step function
+                        hidden_t = _execute_transformer_step(step_tokens, positions.expand(branches, -1), generation, runtime.transformer_step, buffers)
+                        
+                        # Update state machine (force words)
+                        forced = runtime.constants.new_word if i in new_word_steps else runtime.constants.pad
+                        main_token, aux_token, _ = runtime.machine.process(t, state, forced, is_forced=True)
+                        
+                        # Update audio buffer
+                        generation.audio_buf[:, :, t] = step_tokens[:, :, 0]
+                        
+                        self.current_step += 1
+                    
+                    # Clear any pending tokens from this audio so they aren't generated
+                    state.pending_tokens.clear()
+                    state.lookahead_tokens.clear()
+                    state.entries.clear()
+                    state.forced_padding = 0
+                    
+                    # Update decode pos so we don't try to decode this inserted audio
+                    last_decode_pos = self.current_step
+                    
+                    # Update Mimi KV by decoding the inserted audio (silently)
+                    # This keeps the decoder in sync
+                    new_tokens = generation.audio_buf[0:1, :, self.current_step-plan.aligned_frames:self.current_step].clone()
+                    new_tokens[new_tokens >= 2048] = 0
+                    new_tokens[new_tokens < 0] = 0
+                    _, self.mimi_kv = runtime.mimi.decode_streaming(new_tokens, self.mimi_kv)
+                    self.cached_graphs.mimi_kv = self.mimi_kv
+                    
+                    continue
             
             # 2. Run one generation step
             t = self.current_step
