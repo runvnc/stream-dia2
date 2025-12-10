@@ -129,7 +129,7 @@ def run_streaming_generation(
     min_frames_for_decode = 1  # Send first frame ASAP
     
     first_frame_time = None
-    steps_completed = 0
+    first_decode_time = None
     
     t_loop_start = time.perf_counter()
     graphs_were_cached = cached_graphs is not None and cached_graphs.transformer_capture is not None
@@ -178,10 +178,6 @@ def run_streaming_generation(
                     cached_graphs.transformer_capture = transformer_capture
                     cached_graphs.dep_captures = dep_captures
                     cached_graphs.buffers = buffers
-            
-            if first_frame_time is None:
-                first_frame_time = time.perf_counter()
-                print(f"[streaming] First frame: {(first_frame_time - t_loop_start)*1000:.0f}ms (graphs_cached={graphs_were_cached})")
             
             guided_text = apply_classifier_guidance(
                 buffers.text, cfg_active, config.cfg_scale, config.cfg_filter_k
@@ -257,7 +253,9 @@ def run_streaming_generation(
                 audio_buf[:, stage + 1, t + 1] = stage_token
                 prev_audio = stage_token.expand(branches)
             
-            steps_completed += 1
+            if first_frame_time is None:
+                first_frame_time = time.perf_counter()
+                print(f"[streaming] First frame complete: {(first_frame_time - t_loop_start)*1000:.0f}ms (graphs_cached={graphs_were_cached})")
             
             if eos_cutoff is None and state.end_step is not None:
                 eos_cutoff = state.end_step + flush_tail
@@ -288,6 +286,10 @@ def run_streaming_generation(
                 if aligned.shape[-1] > 0:
                     pcm = runtime.mimi.decode(aligned)
                     full_waveform = torch.clamp(pcm[0, 0], -1.0, 1.0)
+                    
+                    if first_decode_time is None:
+                        first_decode_time = time.perf_counter()
+                        print(f"[streaming] First decode: {(first_decode_time - t_loop_start)*1000:.0f}ms")
                     
                     total_samples = full_waveform.shape[0]
                     
