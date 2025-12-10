@@ -498,6 +498,14 @@ def _run_streaming_tts(
             # Clone the warmed-up state to avoid re-processing the prefix
             state = copy.deepcopy(session.warmup_state)
             
+        # DEBUG: Check state before generation
+        print(f"[Dia2] State check before generation:")
+        print(f"  - Pending tokens: {len(state.pending_tokens)}")
+        print(f"  - Lookahead tokens: {len(state.lookahead_tokens)}")
+        print(f"  - Entries: {len(state.entries)}")
+        if len(state.entries) > 0:
+            print(f"  - First entry text: {state.entries[0].text[:50]}...")
+
         state.entries.extend(new_entries)
         
         # Apply initial padding config for the new generation
