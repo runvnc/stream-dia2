@@ -343,7 +343,7 @@ def _run_streaming_tts(
             cfg_scale=cfg_scale,
             text=sampling,
             audio=sampling,
-            use_cuda_graph=False,  # Disabled to test if graph capture is causing first-chunk delay
+            use_cuda_graph=True,  # Re-enabled - graphs help even first chunk
         )
         
         # Parse text and create state machine

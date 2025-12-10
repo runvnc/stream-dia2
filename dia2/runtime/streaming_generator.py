@@ -1,5 +1,6 @@
 """Streaming generator for Dia2 - yields audio chunks during generation."""
 from __future__ import annotations
+import time
 
 from dataclasses import dataclass
 from typing import Iterator, Optional, Any
@@ -111,6 +112,8 @@ def run_streaming_generation(
     # Need enough frames before first decode
     min_frames_for_decode = 1  # Send first frame ASAP, quality improves as more frames arrive
     
+    first_frame_time = None
+    first_decode_time = None
     steps_completed = 0
     
     with torch.inference_mode():
@@ -228,6 +231,10 @@ def run_streaming_generation(
             
             steps_completed += 1
             
+            if first_frame_time is None:
+                first_frame_time = time.perf_counter()
+                print(f"[streaming] First frame generated")
+            
             if eos_cutoff is None and state.end_step is not None:
                 eos_cutoff = state.end_step + flush_tail
             
@@ -260,6 +267,10 @@ def run_streaming_generation(
                     full_waveform = torch.clamp(pcm[0, 0], -1.0, 1.0)
                     
                     total_samples = full_waveform.shape[0]
+                    if first_decode_time is None:
+                        first_decode_time = time.perf_counter()
+                        print(f"[streaming] First decode complete, {total_samples} samples")
+                    
                     if total_samples > samples_sent:
                         new_samples = full_waveform[samples_sent:]
                         
