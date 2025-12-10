@@ -265,6 +265,7 @@ def _create_voice_session(speaker_1_path: str, speaker_2_path: str) -> VoiceSess
     prefix_tokens[prefix_tokens < 0] = 0
     
     _, mimi_kv = runtime.mimi.decode_streaming(prefix_tokens, None)
+    if mimi_kv is None: print("[Dia2] WARNING: Mimi KV cache is None after warmup!")
     print("[Dia2] Mimi decoder warmed up.")
     
     # Snapshot the state machine after warmup for fast restoration
@@ -707,7 +708,7 @@ async def stream_tts(ws: WebSocket):
                         cfg_scale=float(payload.get("cfg_scale", 1.0)),
                         temperature=float(payload.get("temperature", 0.8)),
                         top_k=int(payload.get("top_k", 50)),
-                        chunk_frames=int(payload.get("chunk_frames", 1)),
+                        chunk_frames=int(payload.get("chunk_frames", 3)),
                         prefix_samples_to_skip=_voice_session.prefix_samples_to_skip,
                         continue_session=bool(payload.get("continue_session", False)),
                     )

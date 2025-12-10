@@ -97,7 +97,7 @@ async def stream_tts(
                         await ws.send(json.dumps({
                             "type": "tts",
                             "text": line,
-                            "chunk_frames": 1,
+                            "chunk_frames": 3,
                             "continue_session": True
                         }))
                     except Exception as e:
