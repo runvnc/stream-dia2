@@ -330,6 +330,8 @@ def _run_streaming_tts(
         t_start = time.perf_counter()
         print(f"[Dia2] TTS: {text[:60]}...")
         
+        first_chunk_sent = False
+        
         runtime = dia._ensure_runtime()
         
         # Reset session
@@ -382,6 +384,10 @@ def _run_streaming_tts(
             chunk_count += 1
             pcm16_bytes = waveform_to_pcm16(chunk.waveform)
             total_samples += chunk.waveform.shape[0]
+            
+            if not first_chunk_sent:
+                first_chunk_sent = True
+                print(f"[Dia2] First chunk ready: {(time.perf_counter() - t_start)*1000:.0f}ms")
             
             output_queue.put(AudioChunk(
                 pcm16=pcm16_bytes,
