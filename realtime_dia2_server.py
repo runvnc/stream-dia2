@@ -56,6 +56,7 @@ class VoiceSession:
     current_step: int
     prefix_cache_length: int
     prefix_audio_tokens: torch.Tensor
+    prefix_mimi_kv: Any
     cached_graphs: CachedGraphs  # Reusable CUDA graphs
     prefix_samples_to_skip: int = 0  # Audio samples to skip (prefix duration)
 
@@ -279,6 +280,7 @@ def _create_voice_session(speaker_1_path: str, speaker_2_path: str) -> VoiceSess
     cached_graphs = CachedGraphs()
     
     # Store the warmed mimi state in cached_graphs
+    # And keep a copy for resetting
     cached_graphs.mimi_kv = mimi_kv
     
     elapsed = time.perf_counter() - t0
@@ -293,6 +295,7 @@ def _create_voice_session(speaker_1_path: str, speaker_2_path: str) -> VoiceSess
         current_step=start_step,
         prefix_cache_length=prefix_cache_length,
         prefix_audio_tokens=prefix_audio_tokens,
+        prefix_mimi_kv=mimi_kv,
         cached_graphs=cached_graphs,
         prefix_samples_to_skip=prefix_samples_to_skip,
     )
@@ -317,7 +320,9 @@ def _reset_session_for_new_tts(session: VoiceSession) -> None:
     session.gen_state.audio_buf[:, :, prefix_len:].fill_(runtime.constants.ungenerated)
     session.current_step = session.start_step
     session.current_state = copy.deepcopy(session.warmup_state)
-    # Note: We do NOT reset cached_graphs.mimi_kv because we want to continue from prefix audio context
+    # Reset mimi_kv to the prefix state
+    # We need to deepcopy because the decoder might modify it (though usually it returns new tensors, better safe)
+    session.cached_graphs.mimi_kv = copy.deepcopy(session.prefix_mimi_kv)
 
 
 def _clear_voice_session() -> None:
