@@ -67,6 +67,7 @@ async def stream_tts(
             print("[client] Interactive mode. Type text to speak, or !append <file.wav> to add context.")
             
             async def listen_for_input():
+                print("> ", end="", flush=True)
                 loop = asyncio.get_event_loop()
                 while True:
                     try:
@@ -94,6 +95,7 @@ async def stream_tts(
                             continue
                         
                         # Normal TTS
+                        print("Sending...")
                         await ws.send(json.dumps({
                             "type": "tts",
                             "text": line,

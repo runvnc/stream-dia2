@@ -215,6 +215,24 @@ class ContinuousSession:
             is_idle = not state.entries and not state.pending_tokens
             
             if is_idle:
+                # Flush remaining audio frames that didn't meet the chunk size
+                current_pos = self.current_step + 1
+                if current_pos > last_decode_pos:
+                    new_tokens = audio_buf[0:1, :, last_decode_pos:current_pos].clone()
+                    new_tokens[new_tokens >= 2048] = 0
+                    new_tokens[new_tokens < 0] = 0
+                    
+                    pcm, self.mimi_kv = runtime.mimi.decode_streaming(new_tokens, self.mimi_kv)
+                    self.cached_graphs.mimi_kv = self.mimi_kv
+                    waveform = torch.clamp(pcm[0, 0], -1.0, 1.0)
+                    
+                    if waveform.shape[0] > 0:
+                        pcm16 = (waveform.detach().cpu().numpy() * 32767.0).astype(np.int16).tobytes()
+                        header = struct.pack("!?", True) # Mark as last for this utterance
+                        await websocket.send_bytes(header + pcm16)
+                    
+                    last_decode_pos = current_pos
+
                 if not sent_done:
                     await websocket.send_text(json.dumps({"event": "done"}))
                     sent_done = True
