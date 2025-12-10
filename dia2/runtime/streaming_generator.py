@@ -45,37 +45,6 @@ class CachedGraphs:
     buffers: Optional[NetworkBuffers] = None
 
 
-def _undelay_single_frame(
-    audio_buf: torch.Tensor,
-    frame_idx: int,
-    delays: List[int],
-    pad_id: int,
-) -> torch.Tensor:
-    """
-    Extract a single undelayed frame from the delayed audio buffer.
-    
-    For undelayed frame M, we need delayed[cb_i, M + delay[cb_i]] for each codebook.
-    
-    Args:
-        audio_buf: Delayed audio buffer [batch, codebooks, frames]
-        frame_idx: The undelayed frame index to extract
-        delays: List of delays per codebook
-        pad_id: Padding token ID
-        
-    Returns:
-        Undelayed frame tensor [batch, codebooks, 1]
-    """
-    batch, num_codebooks, total_frames = audio_buf.shape
-    out = audio_buf.new_full((batch, num_codebooks, 1), pad_id)
-    
-    for cb_idx, delay in enumerate(delays):
-        delayed_pos = frame_idx + delay
-        if 0 <= delayed_pos < total_frames:
-            out[:, cb_idx, 0] = audio_buf[:, cb_idx, delayed_pos]
-    
-    return out
-
-
 def run_streaming_generation(
     runtime: RuntimeContext,
     *,
@@ -93,8 +62,9 @@ def run_streaming_generation(
     """
     Streaming generation loop that yields audio chunks as they're generated.
     
-    Uses incremental undelaying and Mimi streaming decode for efficiency.
-    Due to the delay pattern, first audio output is delayed by max_delay frames.
+    Key insight: Due to the delay pattern, when we decode delayed tokens directly,
+    the first max_delay frames of output are "shifted" prefix audio. After that,
+    we get correct new audio. So we decode immediately and skip the prefix portion.
     
     Args:
         runtime: The Dia2 runtime context
@@ -107,7 +77,7 @@ def run_streaming_generation(
         logger: Optional logger for progress
         cached_graphs: Optional pre-captured CUDA graphs for faster generation
         prefix_samples_to_skip: Number of audio samples to skip (prefix duration)
-        initial_mimi_kv: Optional pre-warmed Mimi KV cache
+        initial_mimi_kv: Optional pre-warmed Mimi KV cache (not used in new approach)
         
     Yields:
         StreamingChunk objects containing waveform data
@@ -130,7 +100,6 @@ def run_streaming_generation(
     delays = runtime.audio_delays
     max_delay = int(delay_tensor.max().item()) if delay_tensor.numel() else 0
     flush_tail = max_delay + getattr(runtime.machine, "max_padding", 0)
-    print(f"[streaming] max_delay={max_delay}, start_step={start_step}")
     
     first_word_frame: Optional[int] = None
     eos_cutoff: Optional[int] = None
@@ -161,39 +130,13 @@ def run_streaming_generation(
     sample_rate = runtime.mimi.sample_rate
     samples_per_frame = runtime.mimi.samples_per_frame
     
-    # For streaming with delay pattern:
-    # - We start generating at delayed frame start_step
-    # - To output undelayed frame N, we need delayed frame N + max_delay
-    # - So first new audio (undelayed frame start_step) needs delayed frame start_step + max_delay
-    # - This means we wait max_delay frames before first output
+    # Due to delay pattern, first max_delay frames of decoded output are prefix audio.
+    # We need to skip max_delay * samples_per_frame samples before outputting new audio.
+    samples_to_skip = max_delay * samples_per_frame
+    print(f"[streaming] max_delay={max_delay}, samples_to_skip={samples_to_skip}, start_step={start_step}")
     
-    # Track the next undelayed frame to output
-    # First new audio is at undelayed frame start_step (if not including prefix)
-    next_undelayed_frame = 0 if include_prefix_audio else start_step
-    
-    # Mimi streaming decode state
-    mimi_kv = initial_mimi_kv
-    
-    # Warm up Mimi with prefix frames if needed
-    if mimi_kv is None and start_step > 0:
-        t_warmup_start = time.perf_counter()
-        # Decode prefix frames to build Mimi KV cache
-        prefix_end = start_step  # Delayed frames 0 to start_step-1
-        if prefix_end > max_delay:
-            # Undelay all prefix frames at once and decode in one batch
-            prefix_tokens_delayed = audio_buf[0:1, :, :prefix_end].clone()
-            prefix_tokens_undelayed = undelay_frames(
-                prefix_tokens_delayed[0], delays, token_ids.audio_pad
-            ).unsqueeze(0)
-            
-            undelayed_prefix_len = prefix_tokens_undelayed.shape[-1]
-            if undelayed_prefix_len > 0:
-                # Decode all prefix frames in one call to build KV cache
-                _, mimi_kv = runtime.mimi.decode_streaming(
-                    prefix_tokens_undelayed, mimi_kv
-                )
-                t_warmup = time.perf_counter() - t_warmup_start
-                print(f"[streaming] Mimi warmup: {t_warmup*1000:.0f}ms ({undelayed_prefix_len} frames, batched)")
+    # Start Mimi fresh - no warmup needed with this approach
+    mimi_kv = None
     
     first_frame_time = None
     first_audio_time = None
@@ -203,7 +146,11 @@ def run_streaming_generation(
     
     frames_generated = 0
     chunks_sent = 0
-    total_samples = 0
+    total_samples_output = 0
+    samples_skipped = 0
+    
+    # Track decode position - we decode from start_step onwards
+    last_decode_pos = start_step
     
     with torch.inference_mode():
         for offset in range(max_context):
@@ -333,62 +280,59 @@ def run_streaming_generation(
             if eos_cutoff is None and state.end_step is not None:
                 eos_cutoff = state.end_step + flush_tail
             
-            # Current delayed frame is t+1 (we just generated it)
-            # We can output undelayed frame (t+1) - max_delay = t + 1 - max_delay
-            current_delayed_frame = t + 1
-            max_undelayed_frame = current_delayed_frame - max_delay
+            # Current position is t+1 (we just generated it)
+            current_pos = t + 2  # +2 because we store at t+1 and want to decode up to and including it
+            frames_to_decode = current_pos - last_decode_pos
             
             is_final = (eos_cutoff is not None and t + 1 >= eos_cutoff) or (t + 2 >= audio_buf.shape[-1])
             
-            # Check if we can output new frames
-            frames_ready = max_undelayed_frame - next_undelayed_frame
-            should_output = frames_ready >= chunk_frames or (is_final and frames_ready > 0)
+            # Decode every chunk_frames, or on final
+            should_decode = frames_to_decode >= chunk_frames or (is_final and frames_to_decode > 0)
             
-            if should_output and max_undelayed_frame > next_undelayed_frame:
-                # Output frames from next_undelayed_frame to max_undelayed_frame
-                waveforms = []
+            if should_decode:
+                # Get the new frames (delayed tokens, no undelaying)
+                new_tokens = audio_buf[0:1, :, last_decode_pos:current_pos].clone()
                 
-                for frame_idx in range(next_undelayed_frame, max_undelayed_frame):
-                    # Extract single undelayed frame
-                    undelayed_frame = _undelay_single_frame(
-                        audio_buf[0:1], frame_idx, delays, token_ids.audio_pad
-                    )
-                    
-                    # Decode with Mimi streaming
-                    pcm, mimi_kv = runtime.mimi.decode_streaming(undelayed_frame, mimi_kv)
-                    waveform = torch.clamp(pcm[0, 0], -1.0, 1.0)
-                    
-                    # Take only the last frame's samples (Mimi may output more)
-                    if waveform.shape[0] > samples_per_frame:
-                        waveform = waveform[-samples_per_frame:]
-                    
-                    waveforms.append(waveform)
+                # Decode with Mimi streaming
+                pcm, mimi_kv = runtime.mimi.decode_streaming(new_tokens, mimi_kv)
+                waveform = torch.clamp(pcm[0, 0], -1.0, 1.0)
                 
-                if waveforms:
-                    combined_waveform = torch.cat(waveforms, dim=0)
-                    
+                # Skip prefix samples due to delay pattern
+                if samples_skipped < samples_to_skip:
+                    remaining_to_skip = samples_to_skip - samples_skipped
+                    if waveform.shape[0] <= remaining_to_skip:
+                        # Skip entire chunk
+                        samples_skipped += waveform.shape[0]
+                        last_decode_pos = current_pos
+                        continue
+                    else:
+                        # Skip partial, output rest
+                        waveform = waveform[remaining_to_skip:]
+                        samples_skipped = samples_to_skip
+                
+                if waveform.shape[0] > 0:
                     if first_audio_time is None:
                         first_audio_time = time.perf_counter()
                         print(f"[streaming] First audio: {(first_audio_time - t_loop_start)*1000:.0f}ms")
                     
                     chunks_sent += 1
-                    total_samples += combined_waveform.shape[0]
+                    total_samples_output += waveform.shape[0]
                     
                     yield StreamingChunk(
-                        waveform=combined_waveform,
+                        waveform=waveform,
                         sample_rate=sample_rate,
-                        frame_start=next_undelayed_frame,
-                        frame_end=max_undelayed_frame,
+                        frame_start=last_decode_pos,
+                        frame_end=current_pos,
                         is_final=is_final,
                     )
-                    
-                    next_undelayed_frame = max_undelayed_frame
+                
+                last_decode_pos = current_pos
                 
                 if is_final:
                     break
     
-    duration = total_samples / sample_rate if total_samples > 0 else 0
-    print(f"[streaming] Done: {chunks_sent} chunks, {duration:.2f}s audio")
+    duration = total_samples_output / sample_rate if total_samples_output > 0 else 0
+    print(f"[streaming] Done: {chunks_sent} chunks, {duration:.2f}s audio, skipped {samples_skipped} samples")
 
 
 __all__ = [
