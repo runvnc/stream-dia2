@@ -256,7 +256,8 @@ def _create_voice_session(speaker_1_path: str, speaker_2_path: str) -> VoiceSess
     # The tokens are in gen_state.audio_buf
     # We decode in chunks to simulate streaming if needed, or just one go
     # But decode_streaming expects [B, C, T]
-    prefix_tokens = gen_state.audio_buf[:, :, :prefix_len].clone()
+    # We only decode the first branch (main output) to match streaming generator
+    prefix_tokens = gen_state.audio_buf[0:1, :, :prefix_len].clone()
     _, mimi_kv = runtime.mimi.decode_streaming(prefix_tokens, None)
     print("[Dia2] Mimi decoder warmed up.")
     
