@@ -126,6 +126,9 @@ def run_streaming_generation(
     samples_sent = 0
     last_decode_frame = start_step
     
+    # Streaming decode state
+    mimi_past_kv = None
+    
     # Need enough frames before first decode
     min_frames_for_decode = 1  # Send first frame ASAP
     
@@ -276,41 +279,45 @@ def run_streaming_generation(
                 decode_start = output_start_frame
                 decode_end = current_frame
                 decode_frames = decode_end - decode_start
-                decode_attempt = steps_completed if 'steps_completed' not in dir() else offset + 1
                 
                 t_decode_start = time.perf_counter()
-                all_tokens = audio_buf[0:1, :, decode_start:decode_end].clone()
+                
+                # Get just the NEW frame for streaming decode
+                new_frame_idx = decode_end - 1
+                new_tokens = audio_buf[0:1, :, new_frame_idx:new_frame_idx+1].clone()
                 t_clone = time.perf_counter()
                 
-                aligned = undelay_frames(
-                    all_tokens[0],
-                    runtime.audio_delays,
-                    token_ids.audio_pad
-                ).unsqueeze(0)
                 t_undelay = time.perf_counter()
-                aligned_frames = aligned.shape[-1]
+                
+                # Use streaming decode with KV cache
+                try:
+                    pcm, mimi_past_kv = runtime.mimi.decode_streaming(new_tokens, mimi_past_kv)
+                    waveform = torch.clamp(pcm[0, 0], -1.0, 1.0)
+                except Exception as e:
+                    if first_decode_time is None:
+                        print(f"[streaming] Streaming decode failed: {e}, falling back to regular decode")
+                    # Fallback to regular decode
+                    all_tokens = audio_buf[0:1, :, decode_start:decode_end].clone()
+                    aligned = undelay_frames(all_tokens[0], runtime.audio_delays, token_ids.audio_pad).unsqueeze(0)
+                    if aligned.shape[-1] == 0:
+                        last_decode_frame = current_frame
+                        continue
+                    pcm = runtime.mimi.decode(aligned)
+                    waveform = torch.clamp(pcm[0, 0], -1.0, 1.0)
+                
+                t_mimi = time.perf_counter()
                 
                 if first_decode_time is None:
-                    print(f"[streaming] Decode attempt: input_frames={decode_frames}, aligned_frames={aligned_frames}")
+                    first_decode_time = time.perf_counter()
+                    print(f"[streaming] First decode: {(first_decode_time - t_loop_start)*1000:.0f}ms "
+                          f"(clone={t_clone-t_decode_start:.3f}s, "
+                          f"mimi={t_mimi-t_undelay:.3f}s, "
+                          f"frames={decode_frames})")
                 
-                if aligned.shape[-1] > 0:
-                    pcm = runtime.mimi.decode(aligned)
-                    full_waveform = torch.clamp(pcm[0, 0], -1.0, 1.0)
-                    t_mimi = time.perf_counter()
+                if waveform.shape[0] > 0:
+                    new_samples = waveform[samples_sent:] if samples_sent < waveform.shape[0] else waveform
                     
-                    if first_decode_time is None:
-                        first_decode_time = time.perf_counter()
-                        print(f"[streaming] First decode: {(first_decode_time - t_loop_start)*1000:.0f}ms "
-                              f"(clone={t_clone-t_decode_start:.3f}s, "
-                              f"undelay={t_undelay-t_clone:.3f}s, "
-                              f"mimi={t_mimi-t_undelay:.3f}s, "
-                              f"frames={decode_end-decode_start})")
-                    
-                    total_samples = full_waveform.shape[0]
-                    
-                    if total_samples > samples_sent:
-                        new_samples = full_waveform[samples_sent:]
-                        
+                    if new_samples.shape[0] > 0:
                         yield StreamingChunk(
                             waveform=new_samples,
                             sample_rate=sample_rate,
@@ -319,7 +326,7 @@ def run_streaming_generation(
                             is_final=is_final,
                         )
                         
-                        samples_sent = total_samples
+                        samples_sent += new_samples.shape[0]
                 
                 last_decode_frame = current_frame
                 
