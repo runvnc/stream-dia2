@@ -210,6 +210,7 @@ class ContinuousSession:
         # Streaming state
         chunk_frames = 3
         last_decode_pos = self.current_step
+        sent_done = False
         skipped_samples = 0
         sent_done = False
         steps_since_input = 0
