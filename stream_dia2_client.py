@@ -214,6 +214,10 @@ def main():
             parser.print_help()
             sys.exit(1)
         text = sys.stdin.read().strip() if not sys.stdin.isatty() else "[S1] Hello world."
+        # If interactive, we don't want to send the default text immediately if it's just the example
+    elif args.interactive and args.text:
+        # User provided text arg with interactive mode, send it
+        text = args.text
     else:
         text = args.text
 

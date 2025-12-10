@@ -254,6 +254,8 @@ def _create_voice_session(speaker_1_path: str, speaker_2_path: str) -> VoiceSess
     # let the model generate these text tokens again, or it will speak the prefix text.
     print(f"[Dia2] Clearing {len(warmup_state.pending_tokens)} pending tokens and {len(warmup_state.entries)} remaining entries from warmup state.")
     warmup_state.pending_tokens.clear()
+    print(f"[Dia2] Clearing {len(warmup_state.lookahead_tokens)} lookahead tokens.")
+    warmup_state.lookahead_tokens.clear()
     warmup_state.entries.clear()
     warmup_state.forced_padding = 0
     
@@ -407,6 +409,8 @@ def _append_prefix_sequence(runtime, session: VoiceSession, prefix_plan: PrefixP
     # Clear any pending tokens from the appended sequence so they aren't generated again
     print(f"[Dia2] Appended audio. Clearing {len(state.pending_tokens)} pending tokens.")
     state.pending_tokens.clear()
+    print(f"[Dia2] Clearing {len(state.lookahead_tokens)} lookahead tokens.")
+    state.lookahead_tokens.clear()
     state.entries.clear()
     state.forced_padding = 0
 
