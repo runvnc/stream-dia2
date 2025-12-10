@@ -57,6 +57,7 @@ def run_streaming_generation(
     logger: RuntimeLogger | None = None,
     cached_graphs: Optional[CachedGraphs] = None,
     prefix_samples_to_skip: int = 0,
+    initial_mimi_kv: Optional[Any] = None,
 ) -> Iterator[StreamingChunk]:
     """
     Streaming generation loop that yields audio chunks as they're generated.
@@ -72,6 +73,7 @@ def run_streaming_generation(
         logger: Optional logger for progress
         cached_graphs: Optional pre-captured CUDA graphs for faster first chunk
         prefix_samples_to_skip: Number of audio samples to skip (prefix duration)
+        initial_mimi_kv: Optional pre-warmed Mimi KV cache (skips prefix warmup)
         
     Yields:
         StreamingChunk objects containing waveform data
@@ -130,8 +132,23 @@ def run_streaming_generation(
     
     # Streaming decode state - start fresh
     # Only skip prefix samples if we're including prefix audio (otherwise we already skip by starting at output_start_frame)
-    mimi_kv = None
+    mimi_kv = initial_mimi_kv
     samples_to_skip = prefix_samples_to_skip if include_prefix_audio else 0
+    
+    # Warm up Mimi decoder with prefix frames if needed
+    # This builds the KV cache context so streaming decode works correctly
+    if mimi_kv is None and not include_prefix_audio and start_step > 0:
+        t_mimi_warmup_start = time.perf_counter()
+        # Decode prefix frames to build Mimi KV cache (discard audio output)
+        prefix_tokens = audio_buf[0:1, :, :start_step].clone()
+        if prefix_tokens.shape[-1] > 0:
+            try:
+                _, mimi_kv = runtime.mimi.decode_streaming(prefix_tokens, None)
+                t_mimi_warmup = time.perf_counter() - t_mimi_warmup_start
+                print(f"[streaming] Mimi warmup: {t_mimi_warmup*1000:.0f}ms ({start_step} frames)")
+            except Exception as e:
+                print(f"[streaming] Mimi warmup failed: {e}, continuing without cache")
+                mimi_kv = None
     
     # Need enough frames before first decode
     min_frames_for_decode = 1  # Send first frame ASAP
