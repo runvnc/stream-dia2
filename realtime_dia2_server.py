@@ -6,6 +6,7 @@ Requires BOTH speaker_1 and speaker_2 for voice cloning to work.
 import asyncio
 import base64
 import json
+import copy
 import struct
 import tempfile
 import os
@@ -27,8 +28,10 @@ from dia2 import engine as dia2_engine
 from dia2.runtime.voice_clone import WhisperWord, build_prefix_plan, PrefixPlan
 from dia2.runtime.audio_io import load_mono_audio, encode_audio_tokens
 from dia2.generation import PrefixConfig, normalize_script
-from dia2.runtime.generator import build_initial_state, warmup_with_prefix, GenerationState
+from dia2.runtime.generator import build_initial_state, warmup_with_prefix, GenerationState, _execute_transformer_step
+from dia2.audio.grid import delay_frames
 from dia2.runtime.streaming_generator import run_streaming_generation, StreamingChunk, CachedGraphs
+from dia2.runtime.state_machine import State
 from dia2.runtime.script_parser import parse_script
 
 
@@ -47,7 +50,10 @@ class VoiceSession:
     """Holds the warmed state for a voice - reused across TTS requests."""
     prefix_plan: PrefixPlan
     gen_state: GenerationState
+    warmup_state: State
+    current_state: State
     start_step: int
+    current_step: int
     prefix_cache_length: int
     prefix_audio_tokens: torch.Tensor
     cached_graphs: CachedGraphs  # Reusable CUDA graphs
@@ -206,7 +212,6 @@ def _warmup_model() -> None:
 
 _cuda_executor.submit(_warmup_model).result()
 
-
 # ============================================================================
 # Voice Session Management
 # ============================================================================
@@ -242,6 +247,9 @@ def _create_voice_session(speaker_1_path: str, speaker_2_path: str) -> VoiceSess
     # Run warmup
     start_step = warmup_with_prefix(runtime, prefix_plan, warmup_state, gen_state)
     
+    # Snapshot the state machine after warmup for fast restoration
+    warmup_state_snapshot = copy.deepcopy(warmup_state)
+    
     # Get cache length after warmup
     prefix_cache_length = gen_state.decode.transformer.slots[0].length.item()
     
@@ -263,8 +271,11 @@ def _create_voice_session(speaker_1_path: str, speaker_2_path: str) -> VoiceSess
     
     _voice_session = VoiceSession(
         prefix_plan=prefix_plan,
+        warmup_state=warmup_state_snapshot,
+        current_state=copy.deepcopy(warmup_state_snapshot),
         gen_state=gen_state,
         start_step=start_step,
+        current_step=start_step,
         prefix_cache_length=prefix_cache_length,
         prefix_audio_tokens=prefix_audio_tokens,
         cached_graphs=cached_graphs,
@@ -289,12 +300,70 @@ def _reset_session_for_new_tts(session: VoiceSession) -> None:
     prefix_len = session.prefix_audio_tokens.shape[2]
     session.gen_state.audio_buf[:, :, :prefix_len].copy_(session.prefix_audio_tokens)
     session.gen_state.audio_buf[:, :, prefix_len:].fill_(runtime.constants.ungenerated)
+    session.current_step = session.start_step
+    session.current_state = copy.deepcopy(session.warmup_state)
 
 
 def _clear_voice_session() -> None:
     global _voice_session
     _voice_session = None
     print("[Dia2] Voice session cleared")
+
+
+def _append_prefix_sequence(runtime, session: VoiceSession, prefix_plan: PrefixPlan) -> int:
+    """Append a new prefix sequence (e.g. user audio) to the current session."""
+    start_step = session.current_step
+    generation = session.gen_state
+    state = session.current_state
+    
+    step_tokens = generation.step_tokens
+    model_state = generation.decode
+    branches = step_tokens.shape[0]
+    device = runtime.device
+    tokens = prefix_plan.aligned_tokens.to(device)
+    new_word_steps = set(prefix_plan.new_word_steps)
+    positions = torch.empty(1, 1, dtype=torch.long, device=device)
+    
+    # Ensure we have space
+    if start_step + prefix_plan.aligned_frames >= generation.audio_buf.shape[-1]:
+        raise RuntimeError("Context window full, cannot append audio")
+
+    with torch.inference_mode():
+        for i in range(prefix_plan.aligned_frames):
+            t = start_step + i
+            positions.fill_(t)
+            channels = tokens.shape[0]
+            for cb in range(channels):
+                delay = runtime.audio_delays[cb] if cb < len(runtime.audio_delays) else 0
+                idx = i - delay
+                value = tokens[cb, idx] if idx >= 0 else runtime.constants.audio_bos
+                step_tokens[:, 2 + cb, 0] = value
+            
+            hidden, text_logits, cb0_logits, present = runtime.model.transformer.forward_step(
+                step_tokens,
+                positions.expand(branches, -1),
+                model_state.transformer,
+            )
+            model_state.transformer = present
+
+            forced = runtime.constants.new_word if i in new_word_steps else runtime.constants.pad
+            main_token, aux_token, _ = runtime.machine.process(t, state, forced, is_forced=True)
+            second_token = runtime.constants.pad if aux_token == -1 else aux_token
+            
+            step_tokens[0, 0, 0] = main_token
+            step_tokens[0, 1, 0] = second_token
+            
+            if branches > 1:
+                step_tokens[1:, 0, 0] = runtime.constants.zero
+                step_tokens[1:, 1, 0] = runtime.constants.pad
+            
+            # Update audio buffer for history
+            # Note: we need to write the delayed tokens to the buffer at the correct position
+            # The buffer expects tokens at their generation step
+            # step_tokens already contains the correct delayed values for step t
+            generation.audio_buf[:, :, t] = step_tokens[:, :, 0]
+
+    return start_step + prefix_plan.aligned_frames
 
 
 # ============================================================================
@@ -324,7 +393,6 @@ def save_audio_from_base64(audio_b64: str, suffix: str = ".wav") -> str:
     os.close(fd)
     return path
 
-
 # ============================================================================
 # Streaming TTS
 # ============================================================================
@@ -338,6 +406,7 @@ def _run_streaming_tts(
     top_k: int = 50,
     chunk_frames: int = 1,
     prefix_samples_to_skip: int = 0,
+    continue_session: bool = False,
 ) -> None:
     """Run streaming TTS using the pre-warmed voice session."""
     try:
@@ -348,8 +417,11 @@ def _run_streaming_tts(
         
         runtime = dia._ensure_runtime()
         
-        # Reset session
-        _reset_session_for_new_tts(session)
+        if continue_session:
+            print(f"[Dia2] Continuing session from step {session.current_step}")
+        else:
+            # Reset session
+            _reset_session_for_new_tts(session)
         
         # Config
         sampling = SamplingConfig(temperature=temperature, top_k=top_k)
@@ -362,22 +434,23 @@ def _run_streaming_tts(
         
         # Parse text and create state machine
         normalized_text = normalize_script(text)
-        entries = list(session.prefix_plan.entries)
-        entries.extend(parse_script(
+        new_entries = parse_script(
             [normalized_text],
             runtime.tokenizer,
             runtime.constants,
             runtime.frame_rate
-        ))
+        )
         
-        runtime.machine.initial_padding = config.initial_padding
-        state = runtime.machine.new_state(entries)
+        if continue_session:
+            state = session.current_state
+        else:
+            # Clone the warmed-up state to avoid re-processing the prefix
+            state = copy.deepcopy(session.warmup_state)
+            
+        state.entries.extend(new_entries)
         
-        # Fast-forward state machine through prefix
-        new_word_steps = set(session.prefix_plan.new_word_steps)
-        for t in range(session.start_step + 1):
-            forced = runtime.constants.new_word if t in new_word_steps else runtime.constants.pad
-            runtime.machine.process(t, state, forced, is_forced=True)
+        # Apply initial padding config for the new generation
+        state.padding_budget = config.initial_padding
         
         t_setup = time.perf_counter()
         print(f"[Dia2] Setup: {(t_setup - t_start)*1000:.0f}ms")
@@ -385,13 +458,14 @@ def _run_streaming_tts(
         # Run streaming generation
         chunk_count = 0
         total_samples = 0
+        start_step = session.current_step
         
         for chunk in run_streaming_generation(
             runtime,
             state=state,
             generation=session.gen_state,
             config=config,
-            start_step=session.start_step,
+            start_step=start_step,
             chunk_frames=chunk_frames,
             include_prefix_audio=False,
             cached_graphs=session.cached_graphs,
@@ -413,6 +487,12 @@ def _run_streaming_tts(
             
             if chunk.is_final:
                 break
+        
+        # Update session state
+        # Calculate frames generated based on total samples output
+        frames_generated = total_samples // runtime.mimi.samples_per_frame
+        session.current_step += frames_generated
+        print(f"[Dia2] Session updated to step {session.current_step}")
         
         t_end = time.perf_counter()
         duration = total_samples / runtime.mimi.sample_rate if total_samples > 0 else 0
@@ -441,8 +521,10 @@ async def stream_tts(ws: WebSocket):
        Response: {"event": "voice_ready"}
     3. TTS: {"type": "tts", "text": "[S1] Hello!"}
        Response: Binary audio chunks, then {"event": "done"}
-    4. Clear: {"type": "clear"}
-    5. Close: {"type": "close"}
+    4. Append Audio: {"type": "append_audio", "audio": "<base64>", "text": "optional"}
+       Response: {"event": "appended", "new_step": 123}
+    5. Clear: {"type": "clear"}
+    6. Close: {"type": "close"}
     """
     await ws.accept()
     print("[Dia2] WebSocket connected")
@@ -531,6 +613,42 @@ async def stream_tts(ws: WebSocket):
                     await ws.send_text(json.dumps({"error": f"Voice setup failed: {e}"}))
                 continue
             
+            if msg_type == "append_audio":
+                if _voice_session is None:
+                    await ws.send_text(json.dumps({"error": "Voice not set"}))
+                    continue
+                
+                audio_b64 = payload.get("audio")
+                transcript = payload.get("text")
+                
+                if not audio_b64:
+                    await ws.send_text(json.dumps({"error": "Missing audio data"}))
+                    continue
+                    
+                try:
+                    audio_path = save_audio_from_base64(audio_b64)
+                    temp_files.append(audio_path)
+                    
+                    runtime = dia._ensure_runtime()
+                    
+                    # Build prefix plan for this segment
+                    speaker_id = payload.get("speaker", "speaker_2")
+                    p_cfg = PrefixConfig(speaker_2=audio_path) if speaker_id == "speaker_2" else PrefixConfig(speaker_1=audio_path)
+                    
+                    plan = _cached_build_prefix_plan(runtime, p_cfg)
+                    
+                    # Now append
+                    new_step = _append_prefix_sequence(runtime, _voice_session, plan)
+                    _voice_session.current_step = new_step
+                    
+                    await ws.send_text(json.dumps({"event": "appended", "new_step": new_step}))
+                    
+                except Exception as e:
+                    print(f"[Dia2] Append error: {e}")
+                    traceback.print_exc()
+                    await ws.send_text(json.dumps({"error": str(e)}))
+                continue
+
             if msg_type == "clear":
                 _clear_voice_session()
                 await ws.send_text(json.dumps({"event": "cleared"}))
@@ -563,6 +681,7 @@ async def stream_tts(ws: WebSocket):
                         top_k=int(payload.get("top_k", 50)),
                         chunk_frames=int(payload.get("chunk_frames", 1)),
                         prefix_samples_to_skip=_voice_session.prefix_samples_to_skip,
+                        continue_session=bool(payload.get("continue_session", False)),
                     )
                 )
                 

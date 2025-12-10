@@ -2,3 +2,9 @@ fastapi
 uvicorn[standard]
 numpy
 torch
+whisper-timestamped
+soundfile
+transformers
+accelerate
+safetensors
+websockets

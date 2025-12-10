@@ -43,6 +43,7 @@ class CachedGraphs:
     transformer_capture: Optional[Tuple[Any, torch.Tensor]] = None
     dep_captures: Optional[List[Dict]] = None
     buffers: Optional[NetworkBuffers] = None
+    positions: Optional[torch.Tensor] = None
 
 
 def run_streaming_generation(
@@ -90,7 +91,14 @@ def run_streaming_generation(
     if max_context <= 0:
         raise ValueError("Runtime configuration must specify a positive max_context_steps")
     
-    positions = torch.empty(1, 1, dtype=torch.long, device=runtime.device)
+    # Use cached positions if available to ensure graph replay uses correct memory
+    if cached_graphs is not None and cached_graphs.positions is not None:
+        positions = cached_graphs.positions
+    else:
+        positions = torch.empty(1, 1, dtype=torch.long, device=runtime.device)
+        if cached_graphs is not None:
+            cached_graphs.positions = positions
+
     main_tokens = torch.empty(branches, dtype=torch.long, device=runtime.device)
     aux_tokens = torch.empty(branches, dtype=torch.long, device=runtime.device)
     
