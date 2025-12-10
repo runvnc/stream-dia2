@@ -128,9 +128,10 @@ def run_streaming_generation(
     samples_sent = 0
     last_decode_frame = start_step
     
-    # Streaming decode state - start fresh, skip prefix samples in output
+    # Streaming decode state - start fresh
+    # Only skip prefix samples if we're including prefix audio (otherwise we already skip by starting at output_start_frame)
     mimi_kv = None
-    samples_to_skip = prefix_samples_to_skip
+    samples_to_skip = prefix_samples_to_skip if include_prefix_audio else 0
     
     # Need enough frames before first decode
     min_frames_for_decode = 1  # Send first frame ASAP
