@@ -109,7 +109,7 @@ def run_streaming_generation(
     last_decode_frame = start_step
     
     # Need enough frames before first decode
-    min_frames_for_decode = max_delay  # Minimum possible for fastest first audio
+    min_frames_for_decode = 1  # Send first frame ASAP, quality improves as more frames arrive
     
     steps_completed = 0
     
