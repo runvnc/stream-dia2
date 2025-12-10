@@ -124,6 +124,7 @@ def run_streaming_generation(
     
     # Streaming state
     sample_rate = runtime.mimi.sample_rate
+    samples_per_frame = runtime.mimi.samples_per_frame
     
     # Track where to start outputting audio (skip prefix unless include_prefix_audio)
     output_start_frame = 0 if include_prefix_audio else start_step
@@ -315,7 +316,12 @@ def run_streaming_generation(
                 # Use streaming decode with KV cache
                 try:
                     pcm, mimi_kv = runtime.mimi.decode_streaming(new_tokens, mimi_kv)
-                    waveform = torch.clamp(pcm[0, 0], -1.0, 1.0)
+                    full_waveform = torch.clamp(pcm[0, 0], -1.0, 1.0)
+                    # Mimi outputs audio for ALL frames in context, not just the new frame
+                    # Only take the last frame's worth of samples
+                    if full_waveform.shape[0] > samples_per_frame:
+                        full_waveform = full_waveform[-samples_per_frame:]
+                    waveform = full_waveform
                 except Exception as e:
                     if first_decode_time is None:
                         print(f"[streaming] Streaming decode failed: {e}, falling back to regular decode")
