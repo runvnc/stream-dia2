@@ -56,7 +56,7 @@ def run_streaming_generation(
     include_prefix_audio: bool = False,
     logger: RuntimeLogger | None = None,
     cached_graphs: Optional[CachedGraphs] = None,
-    mimi_past_kv: Optional[Any] = None,
+    prefix_samples_to_skip: int = 0,
 ) -> Iterator[StreamingChunk]:
     """
     Streaming generation loop that yields audio chunks as they're generated.
@@ -71,7 +71,7 @@ def run_streaming_generation(
         include_prefix_audio: If True, include prefix audio in output
         logger: Optional logger for progress
         cached_graphs: Optional pre-captured CUDA graphs for faster first chunk
-        mimi_past_kv: Optional pre-warmed Mimi decoder KV cache (from prefix)
+        prefix_samples_to_skip: Number of audio samples to skip (prefix duration)
         
     Yields:
         StreamingChunk objects containing waveform data
@@ -128,9 +128,9 @@ def run_streaming_generation(
     samples_sent = 0
     last_decode_frame = start_step
     
-    # Streaming decode state
-    # Use pre-warmed KV cache if provided
-    mimi_kv = mimi_past_kv
+    # Streaming decode state - start fresh, skip prefix samples in output
+    mimi_kv = None
+    samples_to_skip = prefix_samples_to_skip
     
     # Need enough frames before first decode
     min_frames_for_decode = 1  # Send first frame ASAP
@@ -318,7 +318,17 @@ def run_streaming_generation(
                           f"frames={decode_frames})")
                 
                 if waveform.shape[0] > 0:
-                    new_samples = waveform[samples_sent:] if samples_sent < waveform.shape[0] else waveform
+                    # Skip prefix samples
+                    if samples_to_skip > 0:
+                        if waveform.shape[0] <= samples_to_skip:
+                            samples_to_skip -= waveform.shape[0]
+                            last_decode_frame = current_frame
+                            continue
+                        else:
+                            waveform = waveform[samples_to_skip:]
+                            samples_to_skip = 0
+                    
+                    new_samples = waveform
                     
                     if new_samples.shape[0] > 0:
                         yield StreamingChunk(

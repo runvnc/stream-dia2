@@ -51,7 +51,7 @@ class VoiceSession:
     prefix_cache_length: int
     prefix_audio_tokens: torch.Tensor
     cached_graphs: CachedGraphs  # Reusable CUDA graphs
-    mimi_past_kv: Any = None  # Pre-warmed Mimi decoder state
+    prefix_samples_to_skip: int = 0  # Audio samples to skip (prefix duration)
 
 
 _voice_session: Optional[VoiceSession] = None
@@ -249,19 +249,11 @@ def _create_voice_session(speaker_1_path: str, speaker_2_path: str) -> VoiceSess
     prefix_len = prefix_plan.aligned_frames + 10
     prefix_audio_tokens = gen_state.audio_buf[:, :, :prefix_len].clone()
     
-    # Warm up Mimi decoder with prefix frames to build KV cache
-    print("[Dia2] Warming up Mimi decoder with prefix...")
-    t_mimi = time.perf_counter()
-    
-    # Feed prefix frames one at a time to build up KV cache
-    mimi_past_kv = None
-    prefix_frames = prefix_plan.aligned_frames
-    with torch.inference_mode():
-        for i in range(prefix_frames):
-            frame_tokens = gen_state.audio_buf[0:1, :, i:i+1]
-            _, mimi_past_kv = runtime.mimi.decode_streaming(frame_tokens, mimi_past_kv)
-    
-    print(f"[Dia2] Mimi warmup: {(time.perf_counter() - t_mimi)*1000:.0f}ms")
+    # Calculate how many audio samples to skip (prefix duration)
+    # Each frame is ~80ms at 12.5Hz, and sample_rate is 24000
+    samples_per_frame = runtime.mimi.sample_rate // int(runtime.mimi.frame_rate)
+    prefix_samples_to_skip = prefix_plan.aligned_frames * samples_per_frame
+    print(f"[Dia2] Prefix: {prefix_plan.aligned_frames} frames, will skip {prefix_samples_to_skip} samples")
     
     # Create empty graph cache - will be populated on first TTS
     cached_graphs = CachedGraphs()
@@ -276,7 +268,7 @@ def _create_voice_session(speaker_1_path: str, speaker_2_path: str) -> VoiceSess
         prefix_cache_length=prefix_cache_length,
         prefix_audio_tokens=prefix_audio_tokens,
         cached_graphs=cached_graphs,
-        mimi_past_kv=mimi_past_kv,
+        prefix_samples_to_skip=prefix_samples_to_skip,
     )
     
     return _voice_session
@@ -345,7 +337,8 @@ def _run_streaming_tts(
     temperature: float = 0.8,
     top_k: int = 50,
     chunk_frames: int = 1,  # Send every frame immediately
-    mimi_past_kv: Any = None,
+    chunk_frames: int = 1,
+    prefix_samples_to_skip: int = 0,
 ) -> None:
     """Run streaming TTS using the pre-warmed voice session."""
     try:
@@ -403,7 +396,7 @@ def _run_streaming_tts(
             chunk_frames=chunk_frames,
             include_prefix_audio=False,
             cached_graphs=session.cached_graphs,
-            mimi_past_kv=mimi_past_kv,
+            prefix_samples_to_skip=prefix_samples_to_skip,
         ):
             chunk_count += 1
             pcm16_bytes = waveform_to_pcm16(chunk.waveform)
@@ -570,7 +563,7 @@ async def stream_tts(ws: WebSocket):
                         temperature=float(payload.get("temperature", 0.8)),
                         top_k=int(payload.get("top_k", 50)),
                         chunk_frames=int(payload.get("chunk_frames", 1)),
-                        mimi_past_kv=_voice_session.mimi_past_kv,
+                        prefix_samples_to_skip=_voice_session.prefix_samples_to_skip,
                     )
                 )
                 
