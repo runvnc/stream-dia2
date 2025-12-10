@@ -185,6 +185,8 @@ class Dia2Client:
             await self.ws.send(json.dumps(payload))
         
         # Start audio stream
+        # Buffer chunks before starting playback to avoid underruns
+        audio_buffer: list[np.ndarray] = []
         self.stream = sd.OutputStream(
             samplerate=self.sample_rate,
             channels=1,
@@ -193,6 +195,9 @@ class Dia2Client:
         self.stream.start()
         
         chunks_received = 0
+        playback_started = False
+        buffer_target_samples = int(self.sample_rate * 2.5)  # Buffer 2.5 seconds before playing
+        buffered_samples = 0
         
         try:
             while True:
@@ -229,8 +234,24 @@ class Dia2Client:
                 audio = pcm16_to_float(pcm16_bytes)
                 
                 if audio.size > 0:
-                    self.stream.write(audio)
                     chunks_received += 1
+                    
+                    if not playback_started:
+                        # Buffer audio until we have enough
+                        audio_buffer.append(audio)
+                        buffered_samples += audio.size
+                        
+                        if buffered_samples >= buffer_target_samples or is_last:
+                            # Start playback with buffered audio
+                            print(f"[client] Starting playback ({buffered_samples / self.sample_rate:.1f}s buffered)")
+                            for buffered_chunk in audio_buffer:
+                                self.stream.write(buffered_chunk)
+                            audio_buffer.clear()
+                            playback_started = True
+                    else:
+                        # Stream directly
+                        self.stream.write(audio)
+                        
         finally:
             if self.stream:
                 await asyncio.sleep(0.5)

@@ -323,7 +323,7 @@ def _run_streaming_tts(
     cfg_scale: float = 1.0,
     temperature: float = 0.8,
     top_k: int = 50,
-    chunk_frames: int = 12,
+    chunk_frames: int = 8,  # ~0.64s chunks for faster first audio
 ) -> None:
     """Run streaming TTS using the pre-warmed voice session."""
     try:
