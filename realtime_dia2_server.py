@@ -1,7 +1,7 @@
 """Dia2 TTS Server with pre-warmed voice state for minimal latency.
 
 Single conversation mode - pre-warms once, reuses state for each TTS request.
-Just resets the generation position between requests.
+Requires BOTH speaker_1 and speaker_2 for voice cloning to work.
 """
 import asyncio
 import base64
@@ -48,13 +48,10 @@ class VoiceSession:
     prefix_plan: PrefixPlan
     gen_state: GenerationState
     start_step: int
-    # Remember the prefix length for resetting
     prefix_cache_length: int
-    # Original audio_buf content (prefix tokens) for resetting
     prefix_audio_tokens: torch.Tensor
 
 
-# Global session (single conversation mode)
 _voice_session: Optional[VoiceSession] = None
 
 
@@ -131,7 +128,7 @@ def _cached_load_audio(audio_path: str, sample_rate: int) -> np.ndarray:
     if file_hash in _audio_data_cache:
         return _audio_data_cache[file_hash]
     
-    print(f"[Dia2] Loading audio...")
+    print(f"[Dia2] Loading audio {os.path.basename(audio_path)}...")
     audio = load_mono_audio(audio_path, sample_rate)
     _audio_data_cache[file_hash] = audio
     return audio
@@ -212,17 +209,22 @@ _cuda_executor.submit(_warmup_model).result()
 # Voice Session Management
 # ============================================================================
 
-def _create_voice_session(speaker_1_path: str) -> VoiceSession:
-    """Create and warm up a voice session."""
+def _create_voice_session(speaker_1_path: str, speaker_2_path: str) -> VoiceSession:
+    """Create and warm up a voice session with BOTH speakers."""
     global _voice_session
     
     t0 = time.perf_counter()
-    print(f"[Dia2] Creating voice session from {speaker_1_path}...")
+    print(f"[Dia2] Creating voice session...")
+    print(f"[Dia2]   Speaker 1: {speaker_1_path}")
+    print(f"[Dia2]   Speaker 2: {speaker_2_path}")
     
     runtime = dia._ensure_runtime()
     
-    # Build prefix plan
-    prefix_config = PrefixConfig(speaker_1=speaker_1_path)
+    # Build prefix plan with BOTH speakers
+    prefix_config = PrefixConfig(
+        speaker_1=speaker_1_path,
+        speaker_2=speaker_2_path,
+    )
     prefix_plan = _cached_build_prefix_plan(runtime, prefix_config)
     
     if prefix_plan is None:
@@ -231,18 +233,18 @@ def _create_voice_session(speaker_1_path: str) -> VoiceSession:
     # Build generation state
     gen_state = build_initial_state(runtime, prefix=prefix_plan)
     
-    # Create state machine for warmup (just prefix entries)
+    # Create state machine for warmup
     runtime.machine.initial_padding = 0
     warmup_state = runtime.machine.new_state(prefix_plan.entries)
     
-    # Run warmup - this primes the transformer cache
+    # Run warmup
     start_step = warmup_with_prefix(runtime, prefix_plan, warmup_state, gen_state)
     
-    # Get the cache length after warmup
+    # Get cache length after warmup
     prefix_cache_length = gen_state.decode.transformer.slots[0].length.item()
     
-    # Save the prefix audio tokens for resetting
-    prefix_len = prefix_plan.aligned_frames + 10  # A bit extra
+    # Save prefix audio tokens
+    prefix_len = prefix_plan.aligned_frames + 10
     prefix_audio_tokens = gen_state.audio_buf[:, :, :prefix_len].clone()
     
     elapsed = time.perf_counter() - t0
@@ -260,24 +262,23 @@ def _create_voice_session(speaker_1_path: str) -> VoiceSession:
 
 
 def _reset_session_for_new_tts(session: VoiceSession) -> None:
-    """Reset the session state for a new TTS request (same voice)."""
+    """Reset the session state for a new TTS request."""
     runtime = dia._ensure_runtime()
     
-    # Reset transformer cache length back to prefix length
+    # Reset transformer cache length
     for slot in session.gen_state.decode.transformer.slots:
         slot.length.fill_(session.prefix_cache_length)
     
     # Reset depformer cache
     session.gen_state.decode.depformer.reset()
     
-    # Restore prefix audio tokens and clear the rest
+    # Restore prefix audio tokens
     prefix_len = session.prefix_audio_tokens.shape[2]
     session.gen_state.audio_buf[:, :, :prefix_len].copy_(session.prefix_audio_tokens)
     session.gen_state.audio_buf[:, :, prefix_len:].fill_(runtime.constants.ungenerated)
 
 
 def _clear_voice_session() -> None:
-    """Clear the voice session entirely."""
     global _voice_session
     _voice_session = None
     print("[Dia2] Voice session cleared")
@@ -331,7 +332,7 @@ def _run_streaming_tts(
         
         runtime = dia._ensure_runtime()
         
-        # Reset session for new generation
+        # Reset session
         _reset_session_for_new_tts(session)
         
         # Config
@@ -343,9 +344,9 @@ def _run_streaming_tts(
             use_cuda_graph=False,
         )
         
-        # Parse new text and create state machine
+        # Parse text and create state machine
         normalized_text = normalize_script(text)
-        entries = list(session.prefix_plan.entries)  # Start with prefix entries
+        entries = list(session.prefix_plan.entries)
         entries.extend(parse_script(
             [normalized_text],
             runtime.tokenizer,
@@ -358,7 +359,7 @@ def _run_streaming_tts(
         
         # Fast-forward state machine through prefix
         new_word_steps = set(session.prefix_plan.new_word_steps)
-        for t in range(session.start_step + 1):  # Include start_step
+        for t in range(session.start_step + 1):
             forced = runtime.constants.new_word if t in new_word_steps else runtime.constants.pad
             runtime.machine.process(t, state, forced, is_forced=True)
         
@@ -413,11 +414,12 @@ async def stream_tts(ws: WebSocket):
     
     Protocol:
     1. Connect -> {"event": "ready", "sample_rate": 24000}
-    2. Set voice (ONCE per conversation): {"type": "set_voice", "speaker_1": "<base64>"}
+    2. Set voice (requires BOTH speakers): 
+       {"type": "set_voice", "speaker_1": "<base64>", "speaker_2": "<base64>"}
        Response: {"event": "voice_ready"}
-    3. TTS (multiple times): {"type": "tts", "text": "[S1] Hello!"}
+    3. TTS: {"type": "tts", "text": "[S1] Hello!"}
        Response: Binary audio chunks, then {"event": "done"}
-    4. Clear (end conversation): {"type": "clear"}
+    4. Clear: {"type": "clear"}
     5. Close: {"type": "close"}
     """
     await ws.accept()
@@ -428,7 +430,7 @@ async def stream_tts(ws: WebSocket):
     async def keepalive():
         try:
             while True:
-                await asyncio.sleep(10)
+                await asyncio.sleep(5)  # More frequent for RunPod
                 try:
                     await ws.send_text(json.dumps({"event": "ping"}))
                 except:
@@ -446,8 +448,16 @@ async def stream_tts(ws: WebSocket):
         
         while True:
             try:
-                msg = await ws.receive_text()
+                msg = await asyncio.wait_for(ws.receive_text(), timeout=60)
+            except asyncio.TimeoutError:
+                # Send ping on timeout to keep connection alive
+                try:
+                    await ws.send_text(json.dumps({"event": "ping"}))
+                except:
+                    break
+                continue
             except WebSocketDisconnect:
+                print("[Dia2] Client disconnected")
                 break
             
             try:
@@ -462,23 +472,41 @@ async def stream_tts(ws: WebSocket):
                 continue
             
             if msg_type == "set_voice":
-                if payload.get("speaker_1"):
-                    suffix = payload.get("format_1", ".wav")
-                    if not suffix.startswith("."):
-                        suffix = "." + suffix
-                    voice_path = save_audio_from_base64(payload["speaker_1"], suffix)
-                    temp_files.append(voice_path)
-                    
-                    await ws.send_text(json.dumps({"event": "warming", "message": "Pre-warming voice..."}))
-                    
-                    loop = asyncio.get_running_loop()
-                    try:
-                        await loop.run_in_executor(_cuda_executor, _create_voice_session, voice_path)
-                        await ws.send_text(json.dumps({"event": "voice_ready"}))
-                    except Exception as e:
-                        await ws.send_text(json.dumps({"error": f"Voice setup failed: {e}"}))
-                else:
-                    await ws.send_text(json.dumps({"error": "Missing speaker_1"}))
+                speaker_1 = payload.get("speaker_1")
+                speaker_2 = payload.get("speaker_2")
+                
+                if not speaker_1 or not speaker_2:
+                    await ws.send_text(json.dumps({
+                        "error": "Both speaker_1 and speaker_2 are required for voice cloning"
+                    }))
+                    continue
+                
+                # Save audio files
+                suffix_1 = payload.get("format_1", ".wav")
+                suffix_2 = payload.get("format_2", ".wav")
+                if not suffix_1.startswith("."): suffix_1 = "." + suffix_1
+                if not suffix_2.startswith("."): suffix_2 = "." + suffix_2
+                
+                voice_path_1 = save_audio_from_base64(speaker_1, suffix_1)
+                voice_path_2 = save_audio_from_base64(speaker_2, suffix_2)
+                temp_files.extend([voice_path_1, voice_path_2])
+                
+                await ws.send_text(json.dumps({"event": "warming", "message": "Pre-warming voices..."}))
+                
+                loop = asyncio.get_running_loop()
+                try:
+                    await loop.run_in_executor(
+                        _cuda_executor, 
+                        _create_voice_session, 
+                        voice_path_1, 
+                        voice_path_2
+                    )
+                    await ws.send_text(json.dumps({"event": "voice_ready"}))
+                except Exception as e:
+                    print(f"[Dia2] Voice setup error: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    await ws.send_text(json.dumps({"error": f"Voice setup failed: {e}"}))
                 continue
             
             if msg_type == "clear":
@@ -496,7 +524,7 @@ async def stream_tts(ws: WebSocket):
                     continue
                 
                 if _voice_session is None:
-                    await ws.send_text(json.dumps({"error": "Voice not set. Call set_voice first."}))
+                    await ws.send_text(json.dumps({"error": "Voice not set. Call set_voice with both speakers first."}))
                     continue
                 
                 chunk_queue: Queue = Queue()
@@ -516,36 +544,40 @@ async def stream_tts(ws: WebSocket):
                 )
                 
                 chunks_sent = 0
-                while True:
-                    try:
-                        chunk = await loop.run_in_executor(
-                            None,
-                            lambda: chunk_queue.get(timeout=0.05)
-                        )
-                    except Empty:
-                        if gen_future.done():
-                            while True:
-                                try:
-                                    chunk = chunk_queue.get_nowait()
-                                    if chunk is None:
+                try:
+                    while True:
+                        try:
+                            chunk = await loop.run_in_executor(
+                                None,
+                                lambda: chunk_queue.get(timeout=0.05)
+                            )
+                        except Empty:
+                            if gen_future.done():
+                                # Drain remaining
+                                while True:
+                                    try:
+                                        chunk = chunk_queue.get_nowait()
+                                        if chunk is None:
+                                            break
+                                        header = struct.pack("!?", chunk.is_last)
+                                        await ws.send_bytes(header + chunk.pcm16)
+                                        chunks_sent += 1
+                                    except Empty:
                                         break
-                                    header = struct.pack("!?", chunk.is_last)
-                                    await ws.send_bytes(header + chunk.pcm16)
-                                    chunks_sent += 1
-                                except Empty:
-                                    break
+                                break
+                            continue
+                        
+                        if chunk is None:
                             break
-                        continue
-                    
-                    if chunk is None:
-                        break
-                    
-                    header = struct.pack("!?", chunk.is_last)
-                    await ws.send_bytes(header + chunk.pcm16)
-                    chunks_sent += 1
-                    
-                    if chunk.is_last:
-                        break
+                        
+                        header = struct.pack("!?", chunk.is_last)
+                        await ws.send_bytes(header + chunk.pcm16)
+                        chunks_sent += 1
+                        
+                        if chunk.is_last:
+                            break
+                except Exception as e:
+                    print(f"[Dia2] Error sending chunks: {e}")
                 
                 await ws.send_text(json.dumps({"event": "done", "chunks": chunks_sent}))
                 print(f"[Dia2] Sent {chunks_sent} chunks")
@@ -554,9 +586,9 @@ async def stream_tts(ws: WebSocket):
             await ws.send_text(json.dumps({"error": f"Unknown type: {msg_type}"}))
     
     except WebSocketDisconnect:
-        print("[Dia2] Client disconnected")
+        print("[Dia2] WebSocket disconnected")
     except Exception as e:
-        print(f"[Dia2] Error: {e}")
+        print(f"[Dia2] WebSocket error: {e}")
         import traceback
         traceback.print_exc()
     finally:

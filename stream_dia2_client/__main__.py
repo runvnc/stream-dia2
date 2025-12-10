@@ -49,6 +49,8 @@ class Dia2Client:
         self._speaker_1_path: Optional[str] = None
         self._speaker_2_path: Optional[str] = None
         self._connected: bool = False
+        self._reconnect_attempts: int = 0
+        self._max_reconnect_attempts: int = 5
     
     async def connect(self) -> None:
         """Connect to the server."""
@@ -70,6 +72,7 @@ class Dia2Client:
             else:
                 raise RuntimeError(f"Unexpected response while connecting: {data}")
         self._connected = True
+        self._reconnect_attempts = 0
     
     async def set_voice(
         self,
@@ -80,25 +83,24 @@ class Dia2Client:
         if not self.ws:
             raise RuntimeError("Not connected")
         
+        if not speaker_1_path or not speaker_2_path:
+            raise ValueError("Both speaker_1_path and speaker_2_path are required for voice cloning")
+        
         # Store paths for reconnection
-        if speaker_1_path:
-            self._speaker_1_path = speaker_1_path
-        if speaker_2_path:
-            self._speaker_2_path = speaker_2_path
+        self._speaker_1_path = speaker_1_path
+        self._speaker_2_path = speaker_2_path
         
         payload: dict = {"type": "set_voice"}
         
-        if speaker_1_path:
-            b64, fmt = load_audio_as_base64(speaker_1_path)
-            payload["speaker_1"] = b64
-            payload["format_1"] = fmt
-            print(f"[client] Setting speaker 1 voice from {speaker_1_path}")
+        b64_1, fmt_1 = load_audio_as_base64(speaker_1_path)
+        payload["speaker_1"] = b64_1
+        payload["format_1"] = fmt_1
+        print(f"[client] Setting speaker 1 voice from {speaker_1_path}")
         
-        if speaker_2_path:
-            b64, fmt = load_audio_as_base64(speaker_2_path)
-            payload["speaker_2"] = b64
-            payload["format_2"] = fmt
-            print(f"[client] Setting speaker 2 voice from {speaker_2_path}")
+        b64_2, fmt_2 = load_audio_as_base64(speaker_2_path)
+        payload["speaker_2"] = b64_2
+        payload["format_2"] = fmt_2
+        print(f"[client] Setting speaker 2 voice from {speaker_2_path}")
         
         await self.ws.send(json.dumps(payload))
         
@@ -127,23 +129,35 @@ class Dia2Client:
     
     async def ensure_connected(self) -> None:
         """Ensure we're connected, reconnecting if necessary."""
-        if self.ws and self._connected:
+        while self._reconnect_attempts < self._max_reconnect_attempts:
+            if self.ws and self._connected:
+                try:
+                    await self.ws.ping()
+                    return
+                except:
+                    self._connected = False
+            
+            self._reconnect_attempts += 1
+            wait_time = min(2 ** self._reconnect_attempts, 30)  # Exponential backoff, max 30s
+            
+            if self._reconnect_attempts > 1:
+                print(f"[client] Reconnect attempt {self._reconnect_attempts}/{self._max_reconnect_attempts} in {wait_time}s...")
+                await asyncio.sleep(wait_time)
+            else:
+                print("[client] Reconnecting...")
+            
             try:
-                await self.ws.ping()
+                await self.connect()
+                if self._speaker_1_path and self._speaker_2_path:
+                    print("[client] Restoring voice settings...")
+                    await self.set_voice(self._speaker_1_path, self._speaker_2_path)
                 return
-            except:
-                pass
+            except Exception as e:
+                print(f"[client] Reconnection failed: {e}")
+                if self._reconnect_attempts >= self._max_reconnect_attempts:
+                    raise RuntimeError(f"Failed to reconnect after {self._max_reconnect_attempts} attempts")
         
-        print("[client] Reconnecting...")
-        self._connected = False
-        try:
-            await self.connect()
-            if self._speaker_1_path or self._speaker_2_path:
-                print("[client] Restoring voice settings...")
-                await self.set_voice(self._speaker_1_path, self._speaker_2_path)
-        except Exception as e:
-            print(f"[client] Reconnection failed: {e}")
-            raise
+        raise RuntimeError(f"Failed to reconnect after {self._max_reconnect_attempts} attempts")
     
     async def speak(
         self,
@@ -257,8 +271,6 @@ async def interactive_mode(
         await client.set_voice(speaker_1_path, speaker_2_path)
     
     print("\nCommands:")
-    print("  /voice <path>     - Set speaker 1 voice")
-    print("  /voice2 <path>    - Set speaker 2 voice")
     print("  /voices <p1> <p2> - Set both voices at once")
     print("  /cfg <value>      - Set CFG scale (default: 3.0)")
     print("  /temp <value>     - Set temperature (default: 0.8)")
@@ -267,6 +279,8 @@ async def interactive_mode(
     print("  /quit             - Exit")
     print("  <text>            - Speak as Speaker 1")
     print(f"\nCurrent settings: cfg={client.cfg_scale}, temp={client.temperature}")
+    if not (speaker_1_path and speaker_2_path):
+        print("\nWARNING: Both --voice and --voice2 are required for voice cloning!")
     print("==============================\n")
     
     try:
@@ -307,16 +321,6 @@ async def interactive_mode(
                     await client.set_voice(speaker_1_path=parts[0], speaker_2_path=parts[1])
                 else:
                     print("  Usage: /voices <speaker1_path> <speaker2_path>")
-                continue
-            
-            if user_input.lower().startswith("/voice2 "):
-                path = user_input[8:].strip()
-                await client.set_voice(speaker_2_path=path)
-                continue
-            
-            if user_input.lower().startswith("/voice "):
-                path = user_input[7:].strip()
-                await client.set_voice(speaker_1_path=path)
                 continue
             
             if user_input.lower().startswith("/s2 "):
