@@ -28,7 +28,7 @@ from dia2.runtime.voice_clone import WhisperWord, build_prefix_plan, PrefixPlan
 from dia2.runtime.audio_io import load_mono_audio, encode_audio_tokens
 from dia2.generation import PrefixConfig, normalize_script
 from dia2.runtime.generator import build_initial_state, warmup_with_prefix, GenerationState
-from dia2.runtime.streaming_generator import run_streaming_generation, StreamingChunk
+from dia2.runtime.streaming_generator import run_streaming_generation, StreamingChunk, CachedGraphs
 from dia2.runtime.script_parser import parse_script
 
 
@@ -50,6 +50,7 @@ class VoiceSession:
     start_step: int
     prefix_cache_length: int
     prefix_audio_tokens: torch.Tensor
+    cached_graphs: CachedGraphs  # Reusable CUDA graphs
 
 
 _voice_session: Optional[VoiceSession] = None
@@ -247,6 +248,9 @@ def _create_voice_session(speaker_1_path: str, speaker_2_path: str) -> VoiceSess
     prefix_len = prefix_plan.aligned_frames + 10
     prefix_audio_tokens = gen_state.audio_buf[:, :, :prefix_len].clone()
     
+    # Create empty graph cache - will be populated on first TTS
+    cached_graphs = CachedGraphs()
+    
     elapsed = time.perf_counter() - t0
     print(f"[Dia2] Voice session ready in {elapsed:.2f}s (start_step={start_step}, cache_len={prefix_cache_length})")
     
@@ -256,6 +260,7 @@ def _create_voice_session(speaker_1_path: str, speaker_2_path: str) -> VoiceSess
         start_step=start_step,
         prefix_cache_length=prefix_cache_length,
         prefix_audio_tokens=prefix_audio_tokens,
+        cached_graphs=cached_graphs,
     )
     
     return _voice_session
@@ -380,6 +385,7 @@ def _run_streaming_tts(
             start_step=session.start_step,
             chunk_frames=chunk_frames,
             include_prefix_audio=False,
+            cached_graphs=session.cached_graphs,
         ):
             chunk_count += 1
             pcm16_bytes = waveform_to_pcm16(chunk.waveform)

@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 
 from dataclasses import dataclass
-from typing import Iterator, Optional, Any
+from typing import Iterator, Optional, Any, Tuple, List, Dict
 
 import torch
 
@@ -37,6 +37,14 @@ class StreamingChunk:
     is_final: bool    # True if this is the last chunk
 
 
+@dataclass
+class CachedGraphs:
+    """Cached CUDA graphs for reuse across TTS calls."""
+    transformer_capture: Optional[Tuple[Any, torch.Tensor]] = None
+    dep_captures: Optional[List[Dict]] = None
+    buffers: Optional[NetworkBuffers] = None
+
+
 def run_streaming_generation(
     runtime: RuntimeContext,
     *,
@@ -44,9 +52,10 @@ def run_streaming_generation(
     generation: GenerationState,
     config: GenerationConfig,
     start_step: int = 0,
-    chunk_frames: int = 25,  # ~2 seconds at 12.5 Hz frame rate
+    chunk_frames: int = 25,
     include_prefix_audio: bool = False,
     logger: RuntimeLogger | None = None,
+    cached_graphs: Optional[CachedGraphs] = None,
 ) -> Iterator[StreamingChunk]:
     """
     Streaming generation loop that yields audio chunks as they're generated.
@@ -60,6 +69,7 @@ def run_streaming_generation(
         chunk_frames: How many frames to accumulate before yielding a chunk
         include_prefix_audio: If True, include prefix audio in output
         logger: Optional logger for progress
+        cached_graphs: Optional pre-captured CUDA graphs for faster first chunk
         
     Yields:
         StreamingChunk objects containing waveform data
@@ -92,11 +102,17 @@ def run_streaming_generation(
     
     transformer_step = runtime.transformer_step
     depformer_step = runtime.depformer_step
-    buffers = _allocate_network_buffers(runtime, branches)
     positions_view = positions.expand(branches, -1)
     
-    transformer_capture = None
-    dep_captures: list[dict] | None = None
+    # Use cached graphs if available, otherwise create new
+    if cached_graphs is not None and cached_graphs.buffers is not None:
+        buffers = cached_graphs.buffers
+        transformer_capture = cached_graphs.transformer_capture
+        dep_captures = cached_graphs.dep_captures
+    else:
+        buffers = _allocate_network_buffers(runtime, branches)
+        transformer_capture = None
+        dep_captures = None
     
     if use_graph:
         _ensure_graph_cublas_ready(runtime.device)
@@ -110,10 +126,9 @@ def run_streaming_generation(
     last_decode_frame = start_step
     
     # Need enough frames before first decode
-    min_frames_for_decode = 1  # Send first frame ASAP, quality improves as more frames arrive
+    min_frames_for_decode = 1  # Send first frame ASAP
     
     first_frame_time = None
-    first_decode_time = None
     steps_completed = 0
     
     with torch.inference_mode():
@@ -154,6 +169,12 @@ def run_streaming_generation(
                     dep_captures=dep_captures,
                 )
                 hidden_t = transformer_capture[1]
+                
+                # Update cache after first capture
+                if cached_graphs is not None and cached_graphs.transformer_capture is None:
+                    cached_graphs.transformer_capture = transformer_capture
+                    cached_graphs.dep_captures = dep_captures
+                    cached_graphs.buffers = buffers
             
             guided_text = apply_classifier_guidance(
                 buffers.text, cfg_active, config.cfg_scale, config.cfg_filter_k
@@ -233,7 +254,6 @@ def run_streaming_generation(
             
             if first_frame_time is None:
                 first_frame_time = time.perf_counter()
-                print(f"[streaming] First frame generated")
             
             if eos_cutoff is None and state.end_step is not None:
                 eos_cutoff = state.end_step + flush_tail
@@ -250,7 +270,6 @@ def run_streaming_generation(
             )
             
             if should_decode:
-                # Decode frames from output_start_frame to current
                 decode_start = output_start_frame
                 decode_end = current_frame
                 
@@ -267,9 +286,6 @@ def run_streaming_generation(
                     full_waveform = torch.clamp(pcm[0, 0], -1.0, 1.0)
                     
                     total_samples = full_waveform.shape[0]
-                    if first_decode_time is None:
-                        first_decode_time = time.perf_counter()
-                        print(f"[streaming] First decode complete, {total_samples} samples")
                     
                     if total_samples > samples_sent:
                         new_samples = full_waveform[samples_sent:]
@@ -292,5 +308,6 @@ def run_streaming_generation(
 
 __all__ = [
     "StreamingChunk",
+    "CachedGraphs",
     "run_streaming_generation",
 ]
