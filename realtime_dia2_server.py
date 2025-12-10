@@ -248,6 +248,14 @@ def _create_voice_session(speaker_1_path: str, speaker_2_path: str) -> VoiceSess
     prefix_len = prefix_plan.aligned_frames + 10
     prefix_audio_tokens = gen_state.audio_buf[:, :, :prefix_len].clone()
     
+    # Warm up Mimi decoder to avoid first-call latency
+    print("[Dia2] Warming up Mimi decoder...")
+    t_mimi = time.perf_counter()
+    dummy_tokens = torch.zeros((1, runtime.model.depformer.num_audio_channels, 10), dtype=torch.long, device=runtime.device)
+    with torch.inference_mode():
+        _ = runtime.mimi.decode(dummy_tokens)
+    print(f"[Dia2] Mimi warmup: {(time.perf_counter() - t_mimi)*1000:.0f}ms")
+    
     # Create empty graph cache - will be populated on first TTS
     cached_graphs = CachedGraphs()
     
