@@ -1,4 +1,5 @@
 import asyncio
+import time
 import base64
 import json
 import struct
@@ -186,6 +187,8 @@ class Dia2Client:
             await self.ensure_connected()
             await self.ws.send(json.dumps(payload))
         
+        request_time = time.perf_counter()
+        
         # Start audio stream
         self.stream = sd.OutputStream(
             samplerate=self.sample_rate,
@@ -197,6 +200,7 @@ class Dia2Client:
         chunks_received = 0
         
         # Optional buffering
+        first_chunk_time: Optional[float] = None
         audio_buffer: list[np.ndarray] = []
         playback_started = (self.buffer_ms == 0)  # Start immediately if no buffer
         buffer_target_samples = int(self.sample_rate * self.buffer_ms / 1000)
@@ -239,6 +243,10 @@ class Dia2Client:
                 if audio.size > 0:
                     chunks_received += 1
                     
+                    if first_chunk_time is None:
+                        first_chunk_time = time.perf_counter()
+                        print(f"[client] First audio: {(first_chunk_time - request_time)*1000:.0f}ms")
+                    
                     if not playback_started:
                         # Buffer audio until we have enough
                         audio_buffer.append(audio)
@@ -256,7 +264,8 @@ class Dia2Client:
                         
         finally:
             if self.stream:
-                await asyncio.sleep(0.5)
+                # Wait for audio to finish playing
+                await asyncio.sleep(1.0)  # Give more time for final audio
                 self.stream.stop()
                 self.stream.close()
                 self.stream = None
