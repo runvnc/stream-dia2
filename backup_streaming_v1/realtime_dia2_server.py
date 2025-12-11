@@ -396,6 +396,11 @@ def _run_tts(
             runtime.frame_rate
         ))
         
+        # FIX: Clear residual text tokens from prefix to prevent hallucination
+        # This ensures the first transformer pass sees a 'new_word' token instead of the last prefix token
+        session.gen_state.step_tokens[:, 0, 0] = runtime.constants.new_word
+        session.gen_state.step_tokens[:, 1, 0] = runtime.constants.pad
+        
         # ONLY use new entries. The prefix is already in the model's KV cache.
         entries = new_entries
         print(f"Entries:", entries) 
