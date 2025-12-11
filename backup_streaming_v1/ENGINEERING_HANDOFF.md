@@ -75,3 +75,12 @@ The next agent should focus on reducing the **buffering delay** without breaking
 - **Impact:** 
   1. Reduces first-chunk latency by eliminating the wait for the next multiple of 3 (saves ~50-100ms).
   2. Produces the smallest possible audio chunks (1 frame / ~20ms), which results in smoother streaming and prevents the "bursty" large chunks you observed.
+
+## Update: Cached Prefix for Zero-Shot Voice Cloning
+**Date:** 2025-12-11
+**Status:** Implemented
+**Changes:**
+- **Architecture:** Implemented a `StateSnapshot` mechanism.
+- **Startup:** The server now loads a prefix audio file (default: `/files/dia2stream/seed42a1.wav`), runs the heavy Whisper alignment and Dia2 pre-fill **once**, and saves the KV cache.
+- **Runtime:** For every request, the session state is restored from this snapshot. This ensures the exact same "Assistant" voice is used every time with **zero latency penalty**.
+- **Buffer:** Reverted to full buffering (`max_delay + 1` frames) to guarantee clean audio, as the prefix cache solves the voice consistency issue, and the generation speed is sufficient for <500ms latency with full buffering.

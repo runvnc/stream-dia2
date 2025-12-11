@@ -12,6 +12,7 @@ import struct
 import tempfile
 import os
 import time
+import copy
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from queue import Queue, Empty
@@ -27,6 +28,7 @@ def _parse_args():
     parser = argparse.ArgumentParser(description="Dia2 Streaming TTS Server")
     parser.add_argument("--port", type=int, default=3030, help="Server port")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Server host")
+    parser.add_argument("--prefix-audio", type=str, default="/files/dia2stream/seed42a1.wav", help="Path to prefix audio for voice cloning")
     parser.add_argument("--seed", type=int, help="Random seed for reproducible generation")
     args, _ = parser.parse_known_args()
     return args
@@ -44,6 +46,7 @@ from dia2.runtime.generator import (
     build_initial_state, 
     GenerationState,
     _allocate_network_buffers,
+    warmup_with_prefix,
     _ensure_graph_cublas_ready,
     _execute_transformer_graph,
     _execute_depformer_graph,
@@ -52,6 +55,8 @@ from dia2.runtime.generator import (
 )
 from dia2.runtime.streaming_generator import CachedGraphs
 from dia2.runtime.script_parser import parse_script
+from dia2.runtime.voice_clone import build_prefix_plan, PrefixPlan
+from dia2.generation import PrefixConfig
 from dia2.generation import normalize_script
 from dia2.runtime.guidance import apply_classifier_guidance, sample_audio_logits
 from dia2.runtime.sampler import sample_token
@@ -74,6 +79,14 @@ _cuda_executor = ThreadPoolExecutor(max_workers=1)
 # =============================================================================
 
 @dataclass
+class StateSnapshot:
+    """Holds a copy of the generation state (KV cache, buffers) after prefix warmup."""
+    transformer_kv: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]  # (k, v, len)
+    audio_buf: torch.Tensor
+    step_tokens: torch.Tensor
+    start_step: int
+
+@dataclass
 class VoiceSession:
     """Holds pre-warmed state for fast TTS - no voice prefix required."""
     gen_state: GenerationState
@@ -81,8 +94,9 @@ class VoiceSession:
     positions: torch.Tensor
     transformer_capture: Any
     dep_captures: List[Dict]
+    prefix_plan: Optional[PrefixPlan] = None
+    snapshot: Optional[StateSnapshot] = None
     
-
 _session: Optional[VoiceSession] = None
 
 
@@ -116,6 +130,8 @@ def _create_session() -> VoiceSession:
     
     transformer_capture = None
     dep_captures = None
+    
+    # --- 1. Warmup for Graph Capture (Dummy Data) ---
     
     # Run 30 frames to capture all graphs
     for t in range(30):
@@ -179,26 +195,85 @@ def _create_session() -> VoiceSession:
     t_end = time.perf_counter()
     print(f"[Dia2] Graph capture complete: {(t_end - t_start)*1000:.0f}ms")
     
+    # --- 2. Warmup for Voice Prefix (Real Data) ---
+    prefix_plan = None
+    snapshot = None
+    
+    if _args.prefix_audio and os.path.exists(_args.prefix_audio):
+        print(f"[Dia2] Processing voice prefix: {_args.prefix_audio}...")
+        t_prefix = time.perf_counter()
+        
+        # Reset state before prefix warmup
+        for slot in gen_state.decode.transformer.slots:
+            slot.length.fill_(0)
+        gen_state.audio_buf.fill_(token_ids.ungenerated)
+        
+        # Build plan (runs Whisper)
+        prefix_cfg = PrefixConfig(speaker_1=_args.prefix_audio)
+        prefix_plan = build_prefix_plan(runtime, prefix_cfg)
+        
+        # Create temporary state machine for warmup
+        state = runtime.machine.new_state(prefix_plan.entries)
+        
+        # Run warmup (fills KV cache)
+        start_step = warmup_with_prefix(runtime, prefix_plan, state, gen_state)
+        
+        # Save snapshot
+        kv_snapshot = []
+        for slot in gen_state.decode.transformer.slots:
+            # Clone keys, values, and length
+            kv_snapshot.append((
+                slot.keys.clone(),
+                slot.values.clone(),
+                slot.length.clone()
+            ))
+            
+        snapshot = StateSnapshot(
+            transformer_kv=kv_snapshot,
+            audio_buf=gen_state.audio_buf.clone(),
+            step_tokens=gen_state.step_tokens.clone(),
+            start_step=start_step
+        )
+        
+        print(f"[Dia2] Prefix processed: {(time.perf_counter() - t_prefix)*1000:.0f}ms, {start_step} frames")
+    
     return VoiceSession(
         gen_state=gen_state,
         buffers=buffers,
         positions=positions,
         transformer_capture=transformer_capture,
         dep_captures=dep_captures,
+        prefix_plan=prefix_plan,
+        snapshot=snapshot,
     )
 
 
 def _reset_session(session: VoiceSession) -> None:
-    """Reset session for new TTS request - keeps tensors/graphs, clears state."""
+    """Reset session for new TTS request - restores snapshot if available."""
     runtime = dia._ensure_runtime()
     
-    # Reset KV cache lengths to 0 (empty)
-    for slot in session.gen_state.decode.transformer.slots:
-        slot.length.fill_(0)
+    if session.snapshot:
+        # Restore from snapshot
+        snap = session.snapshot
+        
+        # Restore KV cache
+        for i, slot in enumerate(session.gen_state.decode.transformer.slots):
+            k, v, l = snap.transformer_kv[i]
+            slot.keys.copy_(k)
+            slot.values.copy_(v)
+            slot.length.copy_(l)
+            
+        # Restore buffers
+        session.gen_state.audio_buf.copy_(snap.audio_buf)
+        session.gen_state.step_tokens.copy_(snap.step_tokens)
+        
+    else:
+        # Reset to empty
+        for slot in session.gen_state.decode.transformer.slots:
+            slot.length.fill_(0)
+        session.gen_state.audio_buf.fill_(runtime.constants.ungenerated)
+
     session.gen_state.decode.depformer.reset()
-    
-    # Clear audio buffer
-    session.gen_state.audio_buf.fill_(runtime.constants.ungenerated)
 
 
 # Initialize session at startup
@@ -243,12 +318,18 @@ def _run_tts(
         
         # Parse text
         normalized = normalize_script(text)
-        entries = list(parse_script(
+        new_entries = list(parse_script(
             [normalized],
             runtime.tokenizer,
             runtime.constants,
             runtime.frame_rate
         ))
+        
+        # Combine with prefix entries if available
+        entries = []
+        if session.prefix_plan:
+            entries.extend(session.prefix_plan.entries)
+        entries.extend(new_entries)
         
         # Create state machine
         runtime.machine.initial_padding = 0
@@ -269,6 +350,16 @@ def _run_tts(
         max_delay = int(delay_tensor.max().item()) if delay_tensor.numel() else 0
         flush_tail = max_delay + getattr(runtime.machine, "max_padding", 0)
         print(f"[Dia2] max_delay: {max_delay} frames")
+        
+        # Determine start step
+        start_step = 0
+        if session.snapshot:
+            start_step = session.snapshot.start_step
+            # Fast-forward state machine through prefix
+            plan = session.prefix_plan
+            for t in range(plan.aligned_frames):
+                forced = token_ids.new_word if t in plan.new_word_steps else token_ids.pad
+                runtime.machine.process(t, state, forced, is_forced=True)
         
         positions_view = positions.expand(branches, -1)
         
@@ -291,7 +382,7 @@ def _run_tts(
         
         max_frames = 500  # Safety limit
         
-        for t in range(max_frames):
+        for t in range(start_step, max_frames):
             if eos_cutoff is not None and t >= eos_cutoff:
                 break
             if t + 1 >= audio_buf.shape[-1]:
@@ -352,20 +443,15 @@ def _run_tts(
             is_final = (eos_cutoff is not None and t + 1 >= eos_cutoff)
             
             # Decode when we have enough frames
-            # Strategy: Decode early (10 frames) with silence padding + fade-in to mask artifacts
-            min_frames = 10
-            should_decode = (frames_generated >= min_frames) or is_final
+            # Strategy: Wait for full alignment (max_delay + 1) to ensure clean audio.
+            frames_before_decode = max_delay + 1
+            should_decode = (frames_generated >= frames_before_decode) or is_final
             
             if should_decode:
                 # Undelay and decode
                 end_pos = frames_generated + 1
                 delayed_tokens = audio_buf[0, :, :end_pos].clone()
                 
-                # Pad with silence if we don't have enough frames for max_delay
-                if delayed_tokens.shape[-1] <= max_delay:
-                    pad_amt = (max_delay + 1) - delayed_tokens.shape[-1]
-                    delayed_tokens = F.pad(delayed_tokens, (0, pad_amt), value=token_ids.audio_pad)
-
                 aligned = undelay_frames(
                     delayed_tokens,
                     runtime.audio_delays,
@@ -381,17 +467,6 @@ def _run_tts(
                 
                 if full_waveform.shape[0] > total_samples_output:
                     waveform = full_waveform[total_samples_output:]
-                    
-                    # Apply fade-in to the very first samples to mask artifacts
-                    if total_samples_output < fade_samples:
-                        # Calculate how much of this chunk needs fading
-                        start_idx = total_samples_output
-                        end_idx = start_idx + waveform.shape[0]
-                        if start_idx < fade_samples:
-                            fade_len = min(end_idx, fade_samples) - start_idx
-                            # Linear fade ramp
-                            ramp = torch.linspace(start_idx/fade_samples, (start_idx+fade_len)/fade_samples, fade_len, device=waveform.device)
-                            waveform[:fade_len] *= ramp
                     
                     if waveform.shape[0] > 0:
                         if chunks_sent == 0:
