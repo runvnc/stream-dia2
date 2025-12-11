@@ -19,6 +19,7 @@ from typing import Optional, List, Dict, Any
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 # Parse args early
@@ -275,7 +276,6 @@ def _run_tts(
         frames_generated = 0
         total_samples_output = 0
         chunks_sent = 0
-        frames_before_decode = max_delay + 1
         
         sample_rate = runtime.mimi.sample_rate
         
@@ -345,14 +345,19 @@ def _run_tts(
             is_final = (eos_cutoff is not None and t + 1 >= eos_cutoff)
             
             # Decode when we have enough frames
-            can_decode = frames_generated >= frames_before_decode
-            should_decode = can_decode and (frames_generated % 3 == 0 or is_final)
+            # Strategy: Decode immediately (buffered by 3 frames) by padding with silence
+            should_decode = (frames_generated % 3 == 0) or is_final
             
             if should_decode:
                 # Undelay and decode
                 end_pos = frames_generated + 1
                 delayed_tokens = audio_buf[0, :, :end_pos].clone()
                 
+                # Pad with silence if we don't have enough frames for max_delay
+                if delayed_tokens.shape[-1] <= max_delay:
+                    pad_amt = (max_delay + 1) - delayed_tokens.shape[-1]
+                    delayed_tokens = F.pad(delayed_tokens, (0, pad_amt), value=token_ids.audio_pad)
+
                 aligned = undelay_frames(
                     delayed_tokens,
                     runtime.audio_delays,
