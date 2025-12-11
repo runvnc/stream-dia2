@@ -240,6 +240,7 @@ def _create_session() -> VoiceSession:
         
         # Run warmup (fills KV cache)
         start_step = warmup_with_prefix(runtime, prefix_plan, state, gen_state)
+        print(f"[Dia2] Warmup complete. Aligned frames: {prefix_plan.aligned_frames}, Start step: {start_step}")
         
         # Save snapshot
         kv_snapshot = []
@@ -504,6 +505,7 @@ def _run_tts(
                 context_window = 50
                 
                 decode_start_frame = max(0, frames_output - context_window)
+                decode_start_frame = min(decode_start_frame, t)  # Safety: never start after current frame
                 end_pos = t + 2
                 
                 delayed_tokens = audio_buf[0, :, decode_start_frame:end_pos].clone()

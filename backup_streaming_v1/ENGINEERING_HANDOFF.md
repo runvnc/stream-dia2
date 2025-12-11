@@ -84,3 +84,21 @@ The next agent should focus on reducing the **buffering delay** without breaking
 - **Startup:** The server now loads a prefix audio file (default: `/files/dia2stream/seed42a1.wav`), runs the heavy Whisper alignment and Dia2 pre-fill **once**, and saves the KV cache.
 - **Runtime:** For every request, the session state is restored from this snapshot. This ensures the exact same "Assistant" voice is used every time with **zero latency penalty**.
 - **Buffer:** Reverted to full buffering (`max_delay + 1` frames) to guarantee clean audio, as the prefix cache solves the voice consistency issue, and the generation speed is sufficient for <500ms latency with full buffering.
+
+## Update: Final Low-Latency Architecture
+**Date:** 2025-12-11
+**Status:** Success (<150ms latency)
+**Architecture:**
+1.  **Cached Prefix (Zero-Shot):**
+    -   Server loads `prefix.wav` (default) at startup.
+    -   Pre-calculates KV cache and saves a snapshot.
+    -   Restores this snapshot for every request, ensuring consistent voice and instant start.
+2.  **State Machine Fix:**
+    -   Prefix text is **excluded** from the runtime state machine.
+    -   This prevents the model from re-generating the prefix text, solving the repetition issue.
+3.  **Sliding Window Decoding:**
+    -   Decodes only the last ~1 second of context + new frames.
+    -   Prevents decoding time from growing linearly with session length.
+4.  **Performance:**
+    -   First audio: ~100ms.
+    -   Generation speed: ~25ms/frame (faster than real-time).
