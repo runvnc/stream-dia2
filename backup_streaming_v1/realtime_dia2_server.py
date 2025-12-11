@@ -354,7 +354,7 @@ def _run_tts(
             # Strategy: Wait for full alignment (max_delay + 1) to ensure clean audio.
             # With ~25ms/frame generation, 19 frames is ~475ms latency.
             frames_before_decode = max_delay + 1
-            should_decode = (frames_generated >= frames_before_decode and frames_generated % 3 == 0) or is_final
+            should_decode = (frames_generated >= frames_before_decode) or is_final
             
             if should_decode:
                 # Undelay and decode
