@@ -379,10 +379,24 @@ def _run_tts(
         if session.snapshot:
             start_step = session.snapshot.start_step
             # Fast-forward state machine through prefix
+            print(f"[Dia2] Fast-forwarding prefix: {len(session.prefix_plan.entries)} entries")
             plan = session.prefix_plan
             for t in range(plan.aligned_frames):
                 forced = token_ids.new_word if t in plan.new_word_steps else token_ids.pad
                 runtime.machine.process(t, state, forced, is_forced=True)
+            
+            remaining_prefix = len(state.entries) - len(new_entries)
+            if remaining_prefix > 0:
+                print(f"[Dia2] WARNING: {remaining_prefix} prefix entries were NOT consumed! Extending fast-forward...")
+                # Force consume remaining prefix entries
+                max_step = max(plan.new_word_steps) + 5
+                for t in range(plan.aligned_frames, max_step):
+                    if len(state.entries) <= len(new_entries):
+                        break
+                    forced = token_ids.new_word if t in plan.new_word_steps else token_ids.pad
+                    runtime.machine.process(t, state, forced, is_forced=True)
+                    start_step = t + 1
+                print(f"[Dia2] Extended fast-forward to step {start_step}")
         
         positions_view = positions.expand(branches, -1)
         
