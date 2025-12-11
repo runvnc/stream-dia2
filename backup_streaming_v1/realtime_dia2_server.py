@@ -61,9 +61,6 @@ _prefix_cache: Dict[str, Any] = {}
 # Store seed for use in generation
 _global_seed = _args.seed
 
-# Global cached CUDA graphs - reused across all requests
-_cached_graphs: Optional[CachedGraphs] = None
-
 
 def _set_seed_if_needed():
     """Reset seed before each generation for reproducibility."""
@@ -74,8 +71,7 @@ def _set_seed_if_needed():
 
 
 def _warmup_model() -> None:
-    """Warmup and compile CUDA graphs for fast generation."""
-    global _cached_graphs
+    """Warmup with CUDA graphs to compile kernels (graphs themselves can't be reused)."""
     try:
         _set_seed_if_needed()
         cfg = GenerationConfig(
@@ -94,9 +90,6 @@ def _warmup_model() -> None:
         state = runtime.machine.new_state(entries)
         gen_state = build_initial_state(runtime, prefix=None)
         
-        # Create cached graphs object to store compiled graphs
-        _cached_graphs = CachedGraphs()
-        
         # Run through streaming generator to compile CUDA graphs
         for chunk in run_streaming_generation(
             runtime,
@@ -105,7 +98,6 @@ def _warmup_model() -> None:
             config=cfg,
             start_step=0,
             chunk_frames=1,
-            cached_graphs=_cached_graphs,
         ):
             pass  # Just run through to compile kernels
         
@@ -187,7 +179,6 @@ def _run_streaming_generation(
     chunk_frames: int = 15,
 ) -> None:
     """Run streaming generation and put chunks into the queue."""
-    global _cached_graphs
     try:
         _set_seed_if_needed()  # Reset seed for reproducible generation
         
@@ -239,7 +230,6 @@ def _run_streaming_generation(
             start_step=start_step,
             chunk_frames=1,  # Decode every frame for lowest latency
             include_prefix_audio=include_prefix_audio,
-            cached_graphs=_cached_graphs,  # Reuse compiled CUDA graphs
         ):
             chunk_count += 1
             pcm16_bytes = waveform_to_pcm16(chunk.waveform)
