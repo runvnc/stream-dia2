@@ -573,12 +573,11 @@ def _run_tts(
                         chunks_sent += 1
                         total_samples_output += waveform.shape[0]
                        
-                        if chunks_sent>150: 
-                            output_queue.put(AudioChunk(
-                                pcm16=waveform_to_pcm16(waveform),
-                                sample_rate=sample_rate,
-                                is_last=is_final,
-                            ))
+                        output_queue.put(AudioChunk(
+                            pcm16=waveform_to_pcm16(waveform),
+                            sample_rate=sample_rate,
+                            is_last=is_final,
+                        ))
                     
                 if is_final:
                     break
