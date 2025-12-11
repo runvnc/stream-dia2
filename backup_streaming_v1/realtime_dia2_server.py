@@ -15,12 +15,19 @@ import tempfile
 import os
 import time
 import copy
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from queue import Queue, Empty
 from typing import Optional, List, Dict, Any, Tuple
 
 import numpy as np
+
+# Force local import of dia2 to ensure patches are applied
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import dia2
+print(f"[Dia2] Loaded dia2 package from: {dia2.__file__}")
+
 import torch
 import torch.nn.functional as F
 import soundfile as sf  # Explicit import for robustness
@@ -109,7 +116,14 @@ def _create_session() -> VoiceSession:
     runtime = dia._ensure_runtime()
     
     # Debug vocab sizes
-    print(f"[Dia2] Vocab: audio={runtime.config.data.audio_vocab_size}, pad={runtime.constants.audio_pad}")
+    vocab_size = runtime.config.data.audio_vocab_size
+    pad_id = runtime.constants.audio_pad
+    print(f"[Dia2] Vocab: audio={vocab_size}, pad={pad_id}")
+    
+    # CRITICAL FIX: Ensure audio_pad is within vocab bounds
+    if pad_id >= vocab_size:
+        print(f"[Dia2] WARNING: audio_pad {pad_id} >= vocab {vocab_size}. Clamping to {vocab_size - 1}.")
+        runtime.constants.audio_pad = vocab_size - 1
     
     # Create generation state (no prefix)
     gen_state = build_initial_state(runtime, prefix=None)
@@ -222,6 +236,7 @@ def _create_session() -> VoiceSession:
             audio, _ = sf.read(path, dtype="float32", always_2d=False)
             if audio.ndim == 2:
                 audio = audio.mean(axis=1)
+            print(f"[Dia2] Audio loaded: shape={audio.shape}, max={audio.max()}, min={audio.min()}")
             return audio
 
         prefix_cfg = PrefixConfig(speaker_1=_args.prefix_audio)
@@ -245,12 +260,8 @@ def _create_session() -> VoiceSession:
         ).to(runtime.device)
         
         # Safety clamp: Ensure no tokens exceed vocab size (prevent CUDA assert)
-        # Assuming vocab size 2048, valid range 0-2047. audio_pad might be 2048.
-        # If audio_pad is >= vocab size, we must clamp it for the model input.
-        vocab_limit = runtime.config.data.audio_vocab_size
-        if token_ids.audio_pad >= vocab_limit:
-             print(f"[Dia2] Warning: audio_pad {token_ids.audio_pad} >= vocab {vocab_limit}. Clamping input.")
-             delayed = torch.clamp(delayed, 0, vocab_limit - 1)
+        if token_ids.audio_pad >= vocab_size:
+             delayed = torch.clamp(delayed, 0, vocab_size - 1)
         
         length = min(delayed.shape[1], gen_state.audio_buf.shape[-1])
         gen_state.audio_buf[0, :, :length] = delayed[:, :length]
