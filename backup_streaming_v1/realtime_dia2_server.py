@@ -329,8 +329,8 @@ def _reset_session(session: VoiceSession) -> None:
             slot.length.copy_(l)
             
         # Restore buffers
-        session.gen_state.audio_buf.copy_(snap.audio_buf)
-        session.gen_state.step_tokens.copy_(snap.step_tokens)
+        #session.gen_state.audio_buf.copy_(snap.audio_buf)
+        #session.gen_state.step_tokens.copy_(snap.step_tokens)
         
     else:
         # Reset to empty
@@ -392,7 +392,7 @@ def _run_tts(
         
         # ONLY use new entries. The prefix is already in the model's KV cache.
         entries = new_entries
-        
+        print(f"Entries:", entries) 
         # Create state machine
         runtime.machine.initial_padding = 0
         state = runtime.machine.new_state(entries)
