@@ -28,7 +28,7 @@ def _parse_args():
     parser = argparse.ArgumentParser(description="Dia2 Streaming TTS Server")
     parser.add_argument("--port", type=int, default=3030, help="Server port")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Server host")
-    parser.add_argument("--prefix-audio", type=str, default="s1.mp3", help="Path to prefix audio for voice cloning")
+    parser.add_argument("--prefix-audio", type=str, default="prefix.wav", help="Path to prefix audio for voice cloning")
     parser.add_argument("--seed", type=int, help="Random seed for reproducible generation")
     args, _ = parser.parse_known_args()
     return args
@@ -211,6 +211,14 @@ def _create_session() -> VoiceSession:
         # Build plan (runs Whisper)
         prefix_cfg = PrefixConfig(speaker_1=_args.prefix_audio)
         prefix_plan = build_prefix_plan(runtime, prefix_cfg)
+        
+        # Safety: Truncate prefix if it exceeds context limits
+        max_allowed = 1000 # ~20 seconds
+        if prefix_plan.aligned_frames > max_allowed:
+            print(f"[Dia2] Warning: Prefix too long ({prefix_plan.aligned_frames} frames), truncating to {max_allowed}")
+            prefix_plan.aligned_frames = max_allowed
+            prefix_plan.aligned_tokens = prefix_plan.aligned_tokens[:, :max_allowed]
+            # Also truncate entries/new_word_steps if possible, but for warmup just limiting frames is key
         
         # Create temporary state machine for warmup
         state = runtime.machine.new_state(prefix_plan.entries)
