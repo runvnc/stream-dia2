@@ -396,10 +396,6 @@ def _run_tts(
             runtime.frame_rate
         ))
         
-        # FIX: Remove padding from the first entry to ensure immediate speaker switch
-        if new_entries:
-            new_entries[0].padding = 0
-        
         # ONLY use new entries. The prefix is already in the model's KV cache.
         entries = new_entries
         print(f"Entries:", entries) 
