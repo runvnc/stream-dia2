@@ -520,7 +520,7 @@ def _run_tts(
                 delayed_tokens = audio_buf[0, :, decode_start_frame:end_pos].clone()
                 
                 # Safety: Pad with silence if context is too short for Mimi (prevents kernel size error)
-                min_context = 20
+                min_context = max_delay + 16  # Ensure enough frames remain after undelay
                 if delayed_tokens.shape[-1] < min_context:
                     pad_amt = min_context - delayed_tokens.shape[-1]
                     delayed_tokens = F.pad(delayed_tokens, (pad_amt, 0), value=token_ids.audio_pad)
