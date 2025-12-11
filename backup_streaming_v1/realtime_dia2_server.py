@@ -451,14 +451,14 @@ def _run_tts(
 
         # FIX: Clear residual text tokens from prefix to prevent hallucination
         # This ensures the first transformer pass sees a 'new_word' token instead of the last prefix token
-        # User requested to "put the tokens for the actual text in step_tokens".
-        # We teacher-force the first token (e.g. [S1]) to align the model immediately.
+        # User requested to "put ALL of the tokens for the requested speech in step_tokens".
+        # We populate both Main and Aux channels to give full context.
         step_tokens.fill_(runtime.constants.pad)
         
         # 1. Advance state machine to load the new entry (consumes new_word)
         runtime.machine.process(start_step - 1, state, runtime.constants.new_word, is_forced=True)
 
-        # 2. Get the first actual token (e.g. [S1]) and set it as input
+        # 2. Populate step_tokens with the first AND second tokens (Main + Aux)
         if entries and entries[0].tokens:
             first_token = entries[0].tokens[0]
             step_tokens[:, 0, 0] = first_token
@@ -470,9 +470,15 @@ def _run_tts(
                 second_token = entries[0].tokens[1]
             step_tokens[:, 1, 0] = second_token
             
-            # 3. Consume it from the pending queue so the state machine expects the *next* token (e.g. "Hi")
+            
+            # Consume first token from pending so machine is in sync
             if state.pending_tokens and state.pending_tokens[0] == first_token:
                 state.pending_tokens.popleft()
+
+            # If there is a second token (e.g. "Hi"), put it in the Aux channel (Channel 1)
+            if state.pending_tokens:
+                second_token = state.pending_tokens[0]
+                step_tokens[:, 1, 0] = second_token
         else:
             step_tokens[:, 0, 0] = runtime.constants.new_word
             step_tokens[:, 1, 0] = runtime.constants.pad
