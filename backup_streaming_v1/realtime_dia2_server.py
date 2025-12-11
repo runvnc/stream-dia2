@@ -494,17 +494,18 @@ def _run_tts(
             
             if should_decode:
                 # Check if we have enough frames for Mimi to be stable
-                # Mimi needs a minimum context (e.g. 16 frames) to avoid kernel size errors
+                # Mimi needs a minimum context (e.g. 32 frames) to avoid kernel size errors
                 # aligned_len = (t + 2) - decode_start_frame - max_delay
                 # We can just check the raw buffer length available
-                if (t + 2) < (max_delay + 16):
+                if (t + 2) < (max_delay + 32):
                     continue
 
                 # Undelay and decode
                 # OPTIMIZATION: Use a sliding window to avoid re-decoding the entire history
                 # We need some context for the vocoder to be stable (e.g. 50 frames / ~0.6s)
                 samples_per_frame = 320  # 24000 / 75
-                context_window = 50
+                context_window = 60
+
                 
                 # Calculate window based on current step t
                 # We want the window to end at t + 2
@@ -517,6 +518,7 @@ def _run_tts(
                 print(f"[Dia2] Debug: t={t}, decode_start={decode_start_frame}, end_pos={end_pos}, raw_len={delayed_tokens.shape[-1]}")
                 # Safety: Pad with silence if context is too short for Mimi (prevents kernel size error)
                 min_context = max_delay + 50  # Increase safety margin to 50 frames (~0.6s)
+                min_context = max_delay + 32  # Ensure enough frames remain after undelay
                 if delayed_tokens.shape[-1] < min_context:
                     pad_amt = min_context - delayed_tokens.shape[-1]
                     delayed_tokens = F.pad(delayed_tokens, (pad_amt, 0), value=token_ids.audio_pad)
