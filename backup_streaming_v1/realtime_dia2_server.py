@@ -497,8 +497,16 @@ def _run_tts(
             
             if should_decode:
                 # Undelay and decode
+                # OPTIMIZATION: Use a sliding window to avoid re-decoding the entire history
+                # We need some context for the vocoder to be stable (e.g. 50 frames / ~0.6s)
+                samples_per_frame = 320  # 24000 / 75
+                frames_output = total_samples_output // samples_per_frame
+                context_window = 50
+                
+                decode_start_frame = max(0, frames_output - context_window)
                 end_pos = t + 2
-                delayed_tokens = audio_buf[0, :, :end_pos].clone()
+                
+                delayed_tokens = audio_buf[0, :, decode_start_frame:end_pos].clone()
                 
                 aligned = undelay_frames(
                     delayed_tokens,
@@ -506,15 +514,19 @@ def _run_tts(
                     token_ids.audio_pad
                 ).unsqueeze(0)
                 
-                aligned[aligned >= 2048] = 0
-                aligned[aligned < 0] = 0
+                # Safety clamp
+                aligned = torch.clamp(aligned, 0, 2047)
                 
                 torch.cuda.synchronize()
                 pcm = runtime.mimi.decode(aligned)
                 full_waveform = torch.clamp(pcm[0, 0], -1.0, 1.0)
                 
-                if full_waveform.shape[0] > total_samples_output:
-                    waveform = full_waveform[total_samples_output:]
+                # Calculate where we are in the stream relative to this slice
+                slice_start_sample = decode_start_frame * samples_per_frame
+                current_offset = total_samples_output - slice_start_sample
+                
+                if full_waveform.shape[0] > current_offset:
+                    waveform = full_waveform[current_offset:]
                     
                     if waveform.shape[0] > 0:
                         if chunks_sent == 0:
