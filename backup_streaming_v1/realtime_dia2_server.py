@@ -241,6 +241,7 @@ def _create_session() -> VoiceSession:
         # Run warmup (fills KV cache)
         start_step = warmup_with_prefix(runtime, prefix_plan, state, gen_state)
         print(f"[Dia2] Warmup complete. Aligned frames: {prefix_plan.aligned_frames}, Start step: {start_step}")
+        print(f"[Dia2] Warmup complete. Aligned frames: {prefix_plan.aligned_frames}, Start step: {start_step}")
         
         # Save snapshot
         kv_snapshot = []
@@ -505,6 +506,13 @@ def _run_tts(
                 context_window = 50
                 
                 decode_start_frame = max(0, frames_output - context_window)
+                
+                # Safety: Ensure window is valid for undelay_frames (must have > max_delay frames)
+                # end_pos - start must be > max_delay
+                # start < end_pos - max_delay
+                max_start = max(0, end_pos - (max_delay + 1))
+                decode_start_frame = min(decode_start_frame, max_start)
+                
                 decode_start_frame = min(decode_start_frame, t)  # Safety: never start after current frame
                 end_pos = t + 2
                 
