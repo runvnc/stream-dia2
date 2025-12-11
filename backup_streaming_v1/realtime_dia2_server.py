@@ -534,6 +534,10 @@ def _run_tts(
                 # Safety clamp
                 aligned = torch.clamp(aligned, 0, 2047)
                 
+                if aligned.shape[-1] < 16:
+                    print(f"[Dia2] Warning: Aligned length {aligned.shape[-1]} too short for Mimi, skipping decode")
+                    continue
+                
                 torch.cuda.synchronize()
                 pcm = runtime.mimi.decode(aligned)
                 full_waveform = torch.clamp(pcm[0, 0], -1.0, 1.0)
