@@ -60,7 +60,7 @@ from dia2.generation import PrefixConfig
 from dia2.generation import normalize_script
 from dia2.runtime.guidance import apply_classifier_guidance, sample_audio_logits
 from dia2.runtime.sampler import sample_token
-from dia2.audio.grid import mask_audio_logits, undelay_frames
+from dia2.audio.grid import mask_audio_logits, undelay_frames, delay_frames
 
 app = FastAPI()
 
@@ -222,6 +222,17 @@ def _create_session() -> VoiceSession:
         
         # Create temporary state machine for warmup
         state = runtime.machine.new_state(prefix_plan.entries)
+        
+        # Populate audio_buf with delayed prefix (CRITICAL: This was missing!)
+        delayed = delay_frames(
+            prefix_plan.aligned_tokens, 
+            runtime.audio_delays, 
+            token_ids.audio_pad
+        ).to(runtime.device)
+        length = min(delayed.shape[1], gen_state.audio_buf.shape[-1])
+        gen_state.audio_buf[0, :, :length] = delayed[:, :length]
+        if branches > 1:
+            gen_state.audio_buf[1:, :, :length] = delayed[:, :length]
         
         # Run warmup (fills KV cache)
         start_step = warmup_with_prefix(runtime, prefix_plan, state, gen_state)
