@@ -462,11 +462,20 @@ def _run_tts(
         if entries and entries[0].tokens:
             first_token = entries[0].tokens[0]
             step_tokens[:, 0, 0] = first_token
+            
+            # FIX: Also set the auxiliary (lookahead) token so the model knows what comes next
+            # If we leave this as PAD, the model thinks the sentence ends at [S1]
+            second_token = token_ids.pad
+            if len(entries[0].tokens) > 1:
+                second_token = entries[0].tokens[1]
+            step_tokens[:, 1, 0] = second_token
+            
             # 3. Consume it from the pending queue so the state machine expects the *next* token (e.g. "Hi")
             if state.pending_tokens and state.pending_tokens[0] == first_token:
                 state.pending_tokens.popleft()
         else:
             step_tokens[:, 0, 0] = runtime.constants.new_word
+            step_tokens[:, 1, 0] = runtime.constants.pad
 
         print(f"[Dia2] max_delay: {max_delay} frames")
         
