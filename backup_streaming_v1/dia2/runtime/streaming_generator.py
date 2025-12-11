@@ -141,15 +141,10 @@ def run_streaming_generation(
     # Due to delay pattern, first max_delay frames of decoded output are prefix audio.
     # We need to skip max_delay * samples_per_frame samples before outputting new audio.
     # UNLESS we are continuing from a cached Mimi state.
-    
+    # DISABLED: Don't skip any samples - output immediately for lowest latency
     mimi_kv = None
-    if cached_graphs is not None and cached_graphs.mimi_kv is not None:
-        mimi_kv = cached_graphs.mimi_kv
-        samples_to_skip = 0
-        print(f"[streaming] Resuming Mimi state. max_delay={max_delay}, samples_to_skip=0")
-    else:
-        samples_to_skip = max_delay * samples_per_frame
-        print(f"[streaming] Fresh Mimi state. max_delay={max_delay}, samples_to_skip={samples_to_skip}")
+    samples_to_skip = 0
+    print(f"[streaming] max_delay={max_delay}, samples_to_skip=0 (disabled)")
     
     first_frame_time = None
     first_audio_time = None
