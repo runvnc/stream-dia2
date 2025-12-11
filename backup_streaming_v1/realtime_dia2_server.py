@@ -398,8 +398,13 @@ def _run_tts(
         
         # FIX: Clear residual text tokens from prefix to prevent hallucination
         # This ensures the first transformer pass sees a 'new_word' token instead of the last prefix token
-        session.gen_state.step_tokens[:, 0, 0] = runtime.constants.new_word
-        session.gen_state.step_tokens[:, 1, 0] = runtime.constants.pad
+        # User requested to "completely clear" it. We reset to initial state (BOS/PAD).
+        # This matches build_initial_state() logic.
+        session.gen_state.step_tokens.fill_(runtime.constants.pad)
+        session.gen_state.step_tokens[0, 0, 0] = runtime.constants.bos
+        session.gen_state.step_tokens[0, 1, 0] = runtime.constants.pad
+        if branches > 1:
+            session.gen_state.step_tokens[1, 0, 0] = runtime.constants.zero
         
         # ONLY use new entries. The prefix is already in the model's KV cache.
         entries = new_entries
