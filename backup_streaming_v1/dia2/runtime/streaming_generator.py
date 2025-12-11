@@ -138,13 +138,12 @@ def run_streaming_generation(
     sample_rate = runtime.mimi.sample_rate
     samples_per_frame = runtime.mimi.samples_per_frame
     
-    # Due to delay pattern, first max_delay frames of decoded output are prefix audio.
-    # We need to skip max_delay * samples_per_frame samples before outputting new audio.
-    # UNLESS we are continuing from a cached Mimi state.
-    # DISABLED: Don't skip any samples - output immediately for lowest latency
+    # Due to the delay pattern in audio codebooks, the first max_delay frames
+    # of decoded output contain scrambled/shifted audio. We need to skip these
+    # samples before outputting valid audio.
     mimi_kv = None
-    samples_to_skip = 0
-    print(f"[streaming] max_delay={max_delay}, samples_to_skip=0 (disabled)")
+    samples_to_skip = max_delay * samples_per_frame
+    print(f"[streaming] max_delay={max_delay}, samples_to_skip={samples_to_skip}")
     
     first_frame_time = None
     first_audio_time = None
