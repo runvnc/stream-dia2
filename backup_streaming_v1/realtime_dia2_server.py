@@ -437,6 +437,11 @@ def _run_tts(
         step_tokens = gen.step_tokens
         audio_buf = gen.audio_buf
         branches = step_tokens.shape[0]
+        
+        token_ids = runtime.constants
+        delay_tensor = runtime.audio_delay_tensor
+        max_delay = int(delay_tensor.max().item()) if delay_tensor.numel() else 0
+        flush_tail = max_delay + getattr(runtime.machine, "max_padding", 0)
 
         # Determine start step
         start_step = 0
@@ -466,10 +471,6 @@ def _run_tts(
         # 4. Force audio history to silence to prevent "machine gun" artifacts from dirty buffer
         step_tokens[:, 2:, 0] = token_ids.audio_bos
 
-        token_ids = runtime.constants
-        delay_tensor = runtime.audio_delay_tensor
-        max_delay = int(delay_tensor.max().item()) if delay_tensor.numel() else 0
-        flush_tail = max_delay + getattr(runtime.machine, "max_padding", 0)
         print(f"[Dia2] max_delay: {max_delay} frames")
         
         positions_view = positions.expand(branches, -1)
