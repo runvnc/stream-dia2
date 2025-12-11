@@ -422,14 +422,16 @@ def _run_tts(
         
         # FIX: Clear residual text tokens from prefix to prevent hallucination
         # This ensures the first transformer pass sees a 'new_word' token instead of the last prefix token
-        session.gen_state.step_tokens[:, 0, 0] = runtime.constants.new_word
-        session.gen_state.step_tokens[:, 1, 0] = runtime.constants.pad
+        # User requested to "completely clear" it. We reset to initial state (BOS/PAD).
+        # This matches build_initial_state() logic.
+        session.gen_state.step_tokens.fill_(runtime.constants.pad)
+        session.gen_state.step_tokens[0, 0, 0] = runtime.constants.bos
+        session.gen_state.step_tokens[0, 1, 0] = runtime.constants.pad
+        if branches > 1:
+            session.gen_state.step_tokens[1, 0, 0] = runtime.constants.zero
         
         # ONLY use new entries. The prefix is already in the model's KV cache.
         entries = new_entries
-        
-        # Get initial padding to silence artifacts during transition
-        first_entry_padding = entries[0].padding if entries else 0
         print(f"Entries:", entries) 
         # Create state machine
         runtime.machine.initial_padding = 0
@@ -538,11 +540,6 @@ def _run_tts(
             else:
                 codebook_token = sample_audio_logits(masked_cb0, temperature, top_k)
             
-            # FIX: Force silence during initial padding to prevent prefix hallucination
-            # The model sees PAD text tokens during this time, so we must prevent it from continuing the prefix audio
-            if frames_generated <= first_entry_padding:
-                codebook_token = torch.full_like(codebook_token, token_ids.audio_bos)
-
             audio_buf[:, 0, t + 1] = codebook_token
             
             prev_audio = codebook_token.expand(branches)
@@ -567,10 +564,6 @@ def _run_tts(
                 else:
                     stage_token = sample_audio_logits(dep_logits[:1], temperature, top_k)
                 
-                # FIX: Force silence during initial padding
-                if frames_generated <= first_entry_padding:
-                    stage_token = torch.full_like(stage_token, token_ids.audio_bos)
-
                 audio_buf[:, stage + 1, t + 1] = stage_token
                 prev_audio = stage_token.expand(branches)
             
