@@ -420,16 +420,6 @@ def _run_tts(
             runtime.frame_rate
         ))
         
-        # FIX: Clear residual text tokens from prefix to prevent hallucination
-        # This ensures the first transformer pass sees a 'new_word' token instead of the last prefix token
-        # User requested to "completely clear" it. We reset to initial state (BOS/PAD).
-        # This matches build_initial_state() logic.
-        session.gen_state.step_tokens.fill_(runtime.constants.pad)
-        session.gen_state.step_tokens[0, 0, 0] = runtime.constants.bos
-        session.gen_state.step_tokens[0, 1, 0] = runtime.constants.pad
-        if branches > 1:
-            session.gen_state.step_tokens[1, 0, 0] = runtime.constants.zero
-        
         # ONLY use new entries. The prefix is already in the model's KV cache.
         entries = new_entries
         print(f"Entries:", entries) 
@@ -447,6 +437,17 @@ def _run_tts(
         step_tokens = gen.step_tokens
         audio_buf = gen.audio_buf
         branches = step_tokens.shape[0]
+
+        # FIX: Clear residual text tokens from prefix to prevent hallucination
+        # This ensures the first transformer pass sees a 'new_word' token instead of the last prefix token
+        # User requested to "completely clear" it. We reset to initial state (BOS/PAD).
+        # This matches build_initial_state() logic.
+        step_tokens.fill_(runtime.constants.pad)
+        step_tokens[0, 0, 0] = runtime.constants.bos
+        step_tokens[0, 1, 0] = runtime.constants.pad
+        if branches > 1:
+            step_tokens[1, 0, 0] = runtime.constants.zero
+
         token_ids = runtime.constants
         delay_tensor = runtime.audio_delay_tensor
         max_delay = int(delay_tensor.max().item()) if delay_tensor.numel() else 0
