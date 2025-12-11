@@ -277,6 +277,11 @@ def _run_tts(
         total_samples_output = 0
         chunks_sent = 0
         
+        # Reset seed for consistent voice if specified
+        if _args.seed is not None:
+            torch.manual_seed(_args.seed)
+            torch.cuda.manual_seed(_args.seed)
+
         sample_rate = runtime.mimi.sample_rate
         
         t_setup = time.perf_counter()
@@ -345,8 +350,9 @@ def _run_tts(
             is_final = (eos_cutoff is not None and t + 1 >= eos_cutoff)
             
             # Decode when we have enough frames
-            # Strategy: Decode immediately (buffered by 3 frames) by padding with silence
-            should_decode = (frames_generated % 3 == 0) or is_final
+            # Strategy: Wait for 8 frames (~400ms) to ensure quality, then decode every 4 frames
+            min_frames = 8
+            should_decode = (frames_generated >= min_frames and frames_generated % 4 == 0) or is_final
             
             if should_decode:
                 # Undelay and decode

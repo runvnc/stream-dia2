@@ -59,3 +59,10 @@ The next agent should focus on reducing the **buffering delay** without breaking
 - Modified `realtime_dia2_server.py` to decode audio immediately (every 3 frames) instead of waiting for the full 19-frame buffer.
 - Implemented dynamic silence padding: If the buffer has fewer than `max_delay + 1` frames, it is padded with `audio_pad` tokens.
 - **Result:** Latency reduced from ~950ms to ~150ms (plus generation time). The first ~1 second of audio is reconstructed with partial codebooks (lower codebooks are real, higher codebooks are silence), which is a necessary trade-off for immediate start.
+
+## Update: Quality & Consistency Fixes
+**Date:** 2025-12-11
+**Status:** Implemented
+**Changes:**
+- **Voice Consistency:** Added logic to reset the random seed (if provided via `--seed`) at the start of *every* request. This ensures the same "random" voice is generated for every connection.
+- **Audio Quality:** Increased initial buffer from 3 frames to **8 frames** (~400ms). This eliminates the "unusable" start by providing sufficient context for the vocoder while keeping latency under 500ms.
