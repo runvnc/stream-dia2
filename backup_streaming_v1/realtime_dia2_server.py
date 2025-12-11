@@ -1,9 +1,10 @@
-"""Dia2 Streaming TTS Server - Low Latency with Cached Prefix.
+"""Dia2 Streaming TTS Server - Stable Low Latency.
 
-Restored to stable architecture:
-1. Cached Prefix for zero-shot voice cloning.
-2. Prefix text excluded from state machine to prevent repetition.
-3. Full buffer decoding (stable) instead of sliding window (crash-prone).
+Architecture:
+1. Cached Prefix: Pre-calculates state for 'prefix.wav' at startup.
+2. Soundfile Loading: Forces robust audio loading to prevent truncation.
+3. Full Buffer Decoding: Stable decoding strategy.
+4. Prefix Skipping: Correctly initializes output pointer to skip prefix audio.
 """
 import argparse
 import asyncio
@@ -22,6 +23,7 @@ from typing import Optional, List, Dict, Any, Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
+import soundfile as sf  # Explicit import for robustness
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 # Parse args early
@@ -105,6 +107,9 @@ def _create_session() -> VoiceSession:
     """Create session and capture CUDA graphs during warmup."""
     print("[Dia2] Creating no-prefix VoiceSession...")
     runtime = dia._ensure_runtime()
+    
+    # Debug vocab sizes
+    print(f"[Dia2] Vocab: audio={runtime.config.data.audio_vocab_size}, pad={runtime.constants.audio_pad}")
     
     # Create generation state (no prefix)
     gen_state = build_initial_state(runtime, prefix=None)
@@ -202,20 +207,25 @@ def _create_session() -> VoiceSession:
     
     if _args.prefix_audio and os.path.exists(_args.prefix_audio):
         print(f"[Dia2] Processing voice prefix: {_args.prefix_audio}...")
-    else:
-        print(f"[Dia2] WARNING: Prefix audio not found at {_args.prefix_audio}. Starting without voice clone.")
-
-    if _args.prefix_audio and os.path.exists(_args.prefix_audio):
         t_prefix = time.perf_counter()
         
         # Reset state before prefix warmup
         for slot in gen_state.decode.transformer.slots:
             slot.length.fill_(0)
-        gen_state.audio_buf.fill_(token_ids.ungenerated)
+        # Initialize with audio_bos instead of ungenerated (-2) to prevent crashes
+        gen_state.audio_buf.fill_(token_ids.audio_bos)
         
         # Build plan (runs Whisper)
+        # We inject a custom load_audio_fn to force soundfile usage
+        def safe_load_audio(path, sr):
+            print(f"[Dia2] Loading audio with soundfile: {path}")
+            audio, _ = sf.read(path, dtype="float32", always_2d=False)
+            if audio.ndim == 2:
+                audio = audio.mean(axis=1)
+            return audio
+
         prefix_cfg = PrefixConfig(speaker_1=_args.prefix_audio)
-        prefix_plan = build_prefix_plan(runtime, prefix_cfg)
+        prefix_plan = build_prefix_plan(runtime, prefix_cfg, load_audio_fn=safe_load_audio)
         
         # Safety: Truncate prefix if it exceeds context limits
         max_allowed = 1000 # ~20 seconds
@@ -233,6 +243,15 @@ def _create_session() -> VoiceSession:
             runtime.audio_delays, 
             token_ids.audio_pad
         ).to(runtime.device)
+        
+        # Safety clamp: Ensure no tokens exceed vocab size (prevent CUDA assert)
+        # Assuming vocab size 2048, valid range 0-2047. audio_pad might be 2048.
+        # If audio_pad is >= vocab size, we must clamp it for the model input.
+        vocab_limit = runtime.config.data.audio_vocab_size
+        if token_ids.audio_pad >= vocab_limit:
+             print(f"[Dia2] Warning: audio_pad {token_ids.audio_pad} >= vocab {vocab_limit}. Clamping input.")
+             delayed = torch.clamp(delayed, 0, vocab_limit - 1)
+        
         length = min(delayed.shape[1], gen_state.audio_buf.shape[-1])
         gen_state.audio_buf[0, :, :length] = delayed[:, :length]
         if branches > 1:
@@ -260,6 +279,8 @@ def _create_session() -> VoiceSession:
         )
         
         print(f"[Dia2] Prefix processed: {(time.perf_counter() - t_prefix)*1000:.0f}ms, {start_step} frames")
+    else:
+        print(f"[Dia2] WARNING: Prefix audio not found at {_args.prefix_audio}. Starting without voice clone.")
     
     return VoiceSession(
         gen_state=gen_state,
@@ -350,7 +371,6 @@ def _run_tts(
         ))
         
         # ONLY use new entries. The prefix is already in the model's KV cache.
-        # This prevents the model from re-generating the prefix text.
         entries = new_entries
         
         # Create state machine
@@ -503,7 +523,8 @@ def _run_tts(
                     token_ids.audio_pad
                 ).unsqueeze(0)
                 
-                # Safety clamp
+                # Safety clamp to valid codebook range (0-2047)
+                # This prevents CUDA errors if audio_pad (2048) leaks into Mimi
                 aligned = torch.clamp(aligned, 0, 2047)
                 
                 torch.cuda.synchronize()
@@ -538,108 +559,6 @@ def _run_tts(
         traceback.print_exc()
     finally:
         output_queue.put(None)
-
-
-# =============================================================================
-# WebSocket Handler
-# =============================================================================
-
-@app.websocket("/ws/stream_tts")
-async def stream_tts(ws: WebSocket):
-    await ws.accept()
-    print("[Dia2] WebSocket connected")
-    
-    try:
-        await ws.send_text(json.dumps({
-            "event": "ready",
-            "sample_rate": dia.sample_rate,
-        }))
-        
-        while True:
-            try:
-                msg = await asyncio.wait_for(ws.receive_text(), timeout=120)
-            except asyncio.TimeoutError:
-                await ws.send_text(json.dumps({"event": "ping"}))
-                continue
-            except Exception:
-                break
-            
-            try:
-                payload = json.loads(msg)
-            except json.JSONDecodeError:
-                await ws.send_text(json.dumps({"error": "Invalid JSON"}))
-                continue
-            
-            msg_type = payload.get("type", "tts")
-            
-            if msg_type == "pong":
-                continue
-            
-            if msg_type == "close":
-                break
-            
-            if msg_type == "tts" or "text" in payload:
-                text = payload.get("text")
-                if not text:
-                    await ws.send_text(json.dumps({"error": "Missing 'text'"}))
-                    continue
-                
-                chunk_queue: Queue = Queue()
-                
-                loop = asyncio.get_running_loop()
-                gen_future = loop.run_in_executor(
-                    _cuda_executor,
-                    lambda: _run_tts(
-                        text=text,
-                        output_queue=chunk_queue,
-                        session=_session,
-                        temperature=float(payload.get("temperature", 0.8)),
-                        top_k=int(payload.get("top_k", 50)),
-                    )
-                )
-                
-                chunks_sent = 0
-                while True:
-                    try:
-                        chunk = await loop.run_in_executor(
-                            None,
-                            lambda: chunk_queue.get(timeout=0.05)
-                        )
-                    except Empty:
-                        if gen_future.done():
-                            while True:
-                                try:
-                                    chunk = chunk_queue.get_nowait()
-                                    if chunk is None:
-                                        break
-                                    header = struct.pack("!?", chunk.is_last)
-                                    await ws.send_bytes(header + chunk.pcm16)
-                                    chunks_sent += 1
-                                except Empty:
-                                    break
-                            break
-                        continue
-                    
-                    if chunk is None:
-                        break
-                    
-                    header = struct.pack("!?", chunk.is_last)
-                    await ws.send_bytes(header + chunk.pcm16)
-                    chunks_sent += 1
-                    
-                    if chunk.is_last:
-                        break
-                
-                await ws.send_text(json.dumps({"event": "done", "chunks": chunks_sent}))
-                print(f"[Dia2] Sent {chunks_sent} chunks")
-                continue
-            
-            await ws.send_text(json.dumps({"error": f"Unknown type: {msg_type}"}))
-    
-    except Exception as e:
-        print(f"[Dia2] WebSocket error: {e}")
-    finally:
-        print("[Dia2] Connection closed")
 
 
 if __name__ == "__main__":
