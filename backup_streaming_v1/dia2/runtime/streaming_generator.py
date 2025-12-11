@@ -314,6 +314,9 @@ def run_streaming_generation(
                     
                 waveform = torch.clamp(pcm[0, 0], -1.0, 1.0)
                 
+                # Force GPU to complete this frame before yielding for true streaming
+                torch.cuda.synchronize()
+                
                 # Skip prefix samples due to delay pattern
                 if samples_skipped < samples_to_skip:
                     remaining_to_skip = samples_to_skip - samples_skipped
