@@ -467,9 +467,6 @@ def _run_tts(
                 state.pending_tokens.popleft()
         else:
             step_tokens[:, 0, 0] = runtime.constants.new_word
-            
-        # 4. Force audio history to silence to prevent "machine gun" artifacts from dirty buffer
-        step_tokens[:, 2:, 0] = token_ids.audio_bos
 
         print(f"[Dia2] max_delay: {max_delay} frames")
         
@@ -515,6 +512,11 @@ def _run_tts(
             gen.reset_dep_cache()
             positions.fill_(t)
             _fill_audio_channels(step_tokens, audio_buf, delay_tensor, t, token_ids.audio_bos)
+
+            # FIX: Force audio channels to BOS at the start to break context from prefix
+            # This prevents the model from continuing the prefix audio/text pattern
+            if t == start_step:
+                step_tokens[:, 2:, 0] = token_ids.audio_bos
             
             # FIX: Force audio channels to BOS at the start to break context from prefix
             # This prevents the model from continuing the prefix audio/text pattern
