@@ -16,11 +16,13 @@ PathLike = Union[str, Path]
 def load_mono_audio(path: PathLike, target_sr: int) -> np.ndarray:
     """Read an audio file, convert to mono float32, and resample to target_sr."""
     path = str(path)
+    print(f"[Dia2] Loading audio: {path}")
     try:
-        audio, sr = sphn.read_wav(path)
+        # Force fallback to soundfile for stability, sphn caused issues
+        raise ImportError("Force soundfile")
+        # audio, sr = sphn.read_wav(path)
     except Exception:
         import soundfile as sf  # Local fallback
-
         audio, sr = sf.read(path, dtype="float32", always_2d=False)
     audio = np.asarray(audio, dtype=np.float32)
     if audio.ndim == 2:
@@ -30,6 +32,7 @@ def load_mono_audio(path: PathLike, target_sr: int) -> np.ndarray:
             audio = sphn.resample_audio(audio, sr, target_sr).astype(np.float32)
         else:
             audio = _resample_linear(audio, sr, target_sr)
+    print(f"[Dia2] Loaded audio: {audio.shape}, duration: {audio.shape[0]/target_sr:.2f}s")
     return audio
 
 
@@ -50,6 +53,7 @@ def encode_audio_tokens(mimi: MimiCodec, audio: np.ndarray) -> torch.Tensor:
         codes, *_ = mimi.encode(waveform, return_dict=False)
     if isinstance(codes, (tuple, list)):
         codes = codes[0]
+    print(f"[Dia2] Encoded tokens: {codes.shape}")
     # Mimi.encode returns [B, num_codebooks, T]; select batch 0.
     codes = codes[0].to(torch.long)
     return codes
