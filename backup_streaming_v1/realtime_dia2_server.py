@@ -581,6 +581,72 @@ def _run_tts(
         output_queue.put(None)
 
 
+@app.websocket("/")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    
+    # Send ready message
+    runtime = dia._ensure_runtime()
+    await websocket.send_json({
+        "event": "ready",
+        "sample_rate": runtime.mimi.sample_rate,
+        "version": "1.0.0"
+    })
+    
+    try:
+        while True:
+            data = await websocket.receive_json()
+            
+            if data.get("type") == "ping":
+                await websocket.send_json({"event": "pong"})
+                continue
+                
+            if data.get("type") == "tts":
+                text = data.get("text")
+                if not text:
+                    continue
+                    
+                # Run TTS in background thread
+                output_queue = Queue()
+                
+                if _session is None:
+                    await websocket.send_json({"error": "Server not ready (no session)"})
+                    continue
+                
+                loop = asyncio.get_event_loop()
+                # Use the single-threaded CUDA executor to ensure serial access to GPU
+                future = loop.run_in_executor(
+                    _cuda_executor, 
+                    _run_tts, 
+                    text, 
+                    output_queue, 
+                    _session,
+                    data.get("temperature", 0.8),
+                    data.get("top_k", 50)
+                )
+                
+                chunks_sent = 0
+                while True:
+                    # Wait for queue item in default executor to avoid blocking event loop
+                    chunk = await loop.run_in_executor(None, output_queue.get)
+                    
+                    if chunk is None:
+                        break
+                        
+                    header = struct.pack("!?", chunk.is_last)
+                    await websocket.send_bytes(header + chunk.pcm16)
+                    chunks_sent += 1
+                
+                await websocket.send_json({"event": "done", "chunks": chunks_sent})
+                
+    except WebSocketDisconnect:
+        print("[Dia2] Client disconnected")
+    except Exception as e:
+        print(f"[Dia2] WebSocket error: {e}")
+        import traceback
+        traceback.print_exc()
+
+
 if __name__ == "__main__":
     import uvicorn
     print(f"[Dia2] Starting server on {_args.host}:{_args.port}")
