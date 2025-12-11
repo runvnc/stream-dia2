@@ -38,7 +38,7 @@ if _args.seed is not None:
 
 from dia2 import Dia2, GenerationConfig, SamplingConfig
 from dia2.runtime.generator import build_initial_state, warmup_with_prefix
-from dia2.runtime.streaming_generator import run_streaming_generation, StreamingChunk
+from dia2.runtime.streaming_generator import run_streaming_generation, StreamingChunk, CachedGraphs
 from dia2.runtime.script_parser import parse_script
 from dia2.runtime.voice_clone import build_prefix_plan
 from dia2.generation import merge_generation_config, normalize_script, PrefixConfig
@@ -61,6 +61,9 @@ _prefix_cache: Dict[str, Any] = {}
 # Store seed for use in generation
 _global_seed = _args.seed
 
+# Global cached graphs for CUDA graph reuse across requests
+_cached_graphs: Optional[CachedGraphs] = None
+
 
 def _set_seed_if_needed():
     """Reset seed before each generation for reproducibility."""
@@ -71,6 +74,8 @@ def _set_seed_if_needed():
 
 
 def _warmup_model() -> None:
+    global _cached_graphs
+    
     try:
         _set_seed_if_needed()
         cfg = GenerationConfig(
@@ -79,8 +84,31 @@ def _warmup_model() -> None:
             audio=SamplingConfig(temperature=0.8, top_k=50),
             use_cuda_graph=True,
         )
-        print("[Dia2] Running warm-up generation...")
-        _ = dia.generate("[S1] Warm up.", config=cfg, output_wav=None, verbose=False)
+        print("[Dia2] Running warm-up generation with graph caching...")
+        
+        # Do warmup using streaming generator to cache graphs
+        runtime = dia._ensure_runtime()
+        normalized_text = normalize_script("[S1] Warm up.")
+        entries = list(parse_script([normalized_text], runtime.tokenizer, runtime.constants, runtime.frame_rate))
+        runtime.machine.initial_padding = cfg.initial_padding
+        state = runtime.machine.new_state(entries)
+        gen_state = build_initial_state(runtime, prefix=None)
+        
+        # Create cached graphs object
+        _cached_graphs = CachedGraphs()
+        
+        # Run generation to populate the cache
+        for chunk in run_streaming_generation(
+            runtime,
+            state=state,
+            generation=gen_state,
+            config=cfg,
+            start_step=0,
+            chunk_frames=1,
+            cached_graphs=_cached_graphs,
+        ):
+            pass  # Just run through to cache graphs
+        
         print("[Dia2] Warm-up complete.")
     except Exception as e:
         print(f"[Dia2] Warm-up failed: {e}")
@@ -159,6 +187,8 @@ def _run_streaming_generation(
     chunk_frames: int = 15,
 ) -> None:
     """Run streaming generation and put chunks into the queue."""
+    global _cached_graphs
+    
     try:
         _set_seed_if_needed()  # Reset seed for reproducible generation
         
@@ -200,6 +230,10 @@ def _run_streaming_generation(
         
         include_prefix_audio = include_prefix
         
+        # Reset Mimi KV cache for fresh generation (don't reuse old audio state)
+        if _cached_graphs is not None:
+            _cached_graphs.mimi_kv = None
+        
         chunk_count = 0
         for chunk in run_streaming_generation(
             runtime,
@@ -207,8 +241,9 @@ def _run_streaming_generation(
             generation=gen_state,
             config=base_config,
             start_step=start_step,
-            chunk_frames=chunk_frames,
+            chunk_frames=1,  # Decode every frame for lowest latency
             include_prefix_audio=include_prefix_audio,
+            cached_graphs=_cached_graphs,
         ):
             chunk_count += 1
             pcm16_bytes = waveform_to_pcm16(chunk.waveform)
