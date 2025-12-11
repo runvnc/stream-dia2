@@ -232,7 +232,7 @@ def _create_session() -> VoiceSession:
             transformer_kv=kv_snapshot,
             audio_buf=gen_state.audio_buf.clone(),
             step_tokens=gen_state.step_tokens.clone(),
-            start_step=start_step
+            start_step=start_step + 1
         )
         
         print(f"[Dia2] Prefix processed: {(time.perf_counter() - t_prefix)*1000:.0f}ms, {start_step} frames")
