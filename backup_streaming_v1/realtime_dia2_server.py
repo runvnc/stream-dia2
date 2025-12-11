@@ -350,8 +350,8 @@ def _run_tts(
             is_final = (eos_cutoff is not None and t + 1 >= eos_cutoff)
             
             # Decode when we have enough frames
-            # Strategy: Wait for 8 frames (~400ms) to ensure quality, then decode every 4 frames
-            min_frames = 8
+            # Strategy: Wait for 15 frames (~375ms gen time) to minimize artifacts while keeping <500ms latency
+            min_frames = 15
             should_decode = (frames_generated >= min_frames and frames_generated % 4 == 0) or is_final
             
             if should_decode:
