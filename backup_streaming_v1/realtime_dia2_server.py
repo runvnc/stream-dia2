@@ -329,8 +329,8 @@ def _reset_session(session: VoiceSession) -> None:
             slot.length.copy_(l)
             
         # Restore buffers
-        #session.gen_state.audio_buf.copy_(snap.audio_buf)
-        #session.gen_state.step_tokens.copy_(snap.step_tokens)
+        session.gen_state.audio_buf.copy_(snap.audio_buf)
+        session.gen_state.step_tokens.copy_(snap.step_tokens)
         
     else:
         # Reset to empty
@@ -474,8 +474,14 @@ def _run_tts(
             guided_text = apply_classifier_guidance(buffers.text, False, 1.0, 50)
             text_token = sample_token(guided_text[:1], temp=temperature, top_k=top_k).item()
             
+            # Force new_word at the start to ensure we switch to the new text immediately
+            is_forced = False
+            if t == start_step:
+                text_token = token_ids.new_word
+                is_forced = True
+
             # State machine
-            main_token, aux_token, _ = runtime.machine.process(t, state, text_token)
+            main_token, aux_token, _ = runtime.machine.process(t, state, text_token, is_forced=is_forced)
             step_tokens[:, 0, 0] = main_token
             step_tokens[:, 1, 0] = aux_token if aux_token != -1 else token_ids.pad
             
@@ -560,13 +566,14 @@ def _run_tts(
                         
                         chunks_sent += 1
                         total_samples_output += waveform.shape[0]
-                        
-                        output_queue.put(AudioChunk(
-                            pcm16=waveform_to_pcm16(waveform),
-                            sample_rate=sample_rate,
-                            is_last=is_final,
-                        ))
-                
+                       
+                        if chunks_sent>150: 
+                            output_queue.put(AudioChunk(
+                                pcm16=waveform_to_pcm16(waveform),
+                                sample_rate=sample_rate,
+                                is_last=is_final,
+                            ))
+                    
                 if is_final:
                     break
         
