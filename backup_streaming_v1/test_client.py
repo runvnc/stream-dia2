@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Simple test client for the backup Dia2 streaming server."""
+"""Streaming test client for Dia2 - plays audio as it arrives."""
 import asyncio
 import json
 import struct
@@ -27,7 +27,7 @@ def pcm16_to_float(pcm: bytes) -> np.ndarray:
     return (arr.astype(np.float32) / 32767.0).clip(-1.0, 1.0)
 
 
-async def tts_request(text: str, ws_url: str = WS_URL):
+async def tts_request(text: str, ws_url: str = WS_URL, stream_playback: bool = True):
     """Send a TTS request and play the audio."""
     print(f"[client] Connecting to {ws_url}...")
     
@@ -41,6 +41,17 @@ async def tts_request(text: str, ws_url: str = WS_URL):
         
         sample_rate = data.get("sample_rate", SAMPLE_RATE)
         print(f"[client] Connected, sample_rate={sample_rate}")
+        
+        # Setup streaming playback
+        stream = None
+        if stream_playback and HAS_AUDIO:
+            stream = sd.OutputStream(
+                samplerate=sample_rate,
+                channels=1,
+                dtype='float32',
+                blocksize=1024,
+            )
+            stream.start()
         
         # Send TTS request (no voice cloning)
         request_time = time.time()
@@ -72,6 +83,12 @@ async def tts_request(text: str, ws_url: str = WS_URL):
                     latency = (first_chunk_time - request_time) * 1000
                     print(f"[client] *** FIRST CHUNK LATENCY: {latency:.0f}ms ***")
                 
+                # Play immediately if streaming
+                if stream is not None:
+                    audio_float = pcm16_to_float(pcm_data)
+                    stream.write(audio_float)
+                    print(f"[client] Played chunk: {len(audio_float)} samples")
+                
                 if is_last:
                     break
             else:
@@ -90,13 +107,20 @@ async def tts_request(text: str, ws_url: str = WS_URL):
                 else:
                     print(f"[client] Event: {data}")
         
-        # Play audio
-        if audio_chunks and HAS_AUDIO:
+        # Stop streaming playback
+        if stream is not None:
+            stream.stop()
+            stream.close()
+            print(f"[client] Streaming playback complete")
+        
+        # Play all at once if not streaming
+        elif audio_chunks and HAS_AUDIO:
             all_pcm = b"".join(audio_chunks)
             audio = pcm16_to_float(all_pcm)
             print(f"[client] Playing {len(audio)/sample_rate:.2f}s of audio...")
             sd.play(audio, sample_rate)
             sd.wait()
+        
         elif audio_chunks:
             all_pcm = b"".join(audio_chunks)
             print(f"[client] Received {len(all_pcm)} bytes of audio (playback disabled)")
@@ -185,12 +209,13 @@ if __name__ == "__main__":
     parser.add_argument("text", nargs="?", help="Text to synthesize")
     parser.add_argument("--url", default=WS_URL, help="WebSocket URL")
     parser.add_argument("-i", "--interactive", action="store_true", help="Interactive mode")
+    parser.add_argument("--no-stream", action="store_true", help="Disable streaming playback (play all at end)")
     args = parser.parse_args()
     
     if args.interactive:
         asyncio.run(interactive_mode(args.url))
     elif args.text:
-        asyncio.run(tts_request(args.text, args.url))
+        asyncio.run(tts_request(args.text, args.url, stream_playback=not args.no_stream))
     else:
         # Default test
-        asyncio.run(tts_request("[S1] Hello! This is a test of the Dia2 streaming server.", args.url))
+        asyncio.run(tts_request("[S1] Hello! This is a test of the Dia2 streaming server.", args.url, stream_playback=not args.no_stream))
