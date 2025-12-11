@@ -1,8 +1,9 @@
-"""Dia2 Streaming TTS Server - No-Prefix VoiceSession for Low Latency.
+"""Dia2 Streaming TTS Server - Low Latency with Cached Prefix.
 
-This version creates a VoiceSession at startup WITHOUT voice prefix.
-CUDA graphs are captured once during warmup and reused for all requests.
-KV cache is reset to empty between requests.
+Restored to stable architecture:
+1. Cached Prefix for zero-shot voice cloning.
+2. Prefix text excluded from state machine to prevent repetition.
+3. Full buffer decoding (stable) instead of sliding window (crash-prone).
 """
 import argparse
 import asyncio
@@ -222,12 +223,11 @@ def _create_session() -> VoiceSession:
             print(f"[Dia2] Warning: Prefix too long ({prefix_plan.aligned_frames} frames), truncating to {max_allowed}")
             prefix_plan.aligned_frames = max_allowed
             prefix_plan.aligned_tokens = prefix_plan.aligned_tokens[:, :max_allowed]
-            # Also truncate entries/new_word_steps if possible, but for warmup just limiting frames is key
         
         # Create temporary state machine for warmup
         state = runtime.machine.new_state(prefix_plan.entries)
         
-        # Populate audio_buf with delayed prefix (CRITICAL: This was missing!)
+        # Populate audio_buf with delayed prefix (CRITICAL for stability)
         delayed = delay_frames(
             prefix_plan.aligned_tokens, 
             runtime.audio_delays, 
@@ -240,7 +240,6 @@ def _create_session() -> VoiceSession:
         
         # Run warmup (fills KV cache)
         start_step = warmup_with_prefix(runtime, prefix_plan, state, gen_state)
-        print(f"[Dia2] Warmup complete. Aligned frames: {prefix_plan.aligned_frames}, Tokens shape: {prefix_plan.aligned_tokens.shape}, Start step: {start_step}")
         print(f"[Dia2] Warmup complete. Aligned frames: {prefix_plan.aligned_frames}, Start step: {start_step}")
         
         # Save snapshot
@@ -351,6 +350,7 @@ def _run_tts(
         ))
         
         # ONLY use new entries. The prefix is already in the model's KV cache.
+        # This prevents the model from re-generating the prefix text.
         entries = new_entries
         
         # Create state machine
@@ -386,7 +386,6 @@ def _run_tts(
         frames_generated = 0
         total_samples_output = 0
         chunks_sent = 0
-        fade_samples = 4800  # ~200ms at 24kHz
         
         # If we have a prefix, calculate its length in samples so we can skip it in output
         if session.prefix_plan:
@@ -493,60 +492,26 @@ def _run_tts(
             should_decode = (frames_generated >= frames_before_decode) or is_final
             
             if should_decode:
-                # Check if we have enough frames for Mimi to be stable
-                # Mimi needs a minimum context (e.g. 32 frames) to avoid kernel size errors
-                # aligned_len = (t + 2) - decode_start_frame - max_delay
-                # We can just check the raw buffer length available
-                if (t + 2) < (max_delay + 32):
-                    continue
-
                 # Undelay and decode
-                # OPTIMIZATION: Use a sliding window to avoid re-decoding the entire history
-                # We need some context for the vocoder to be stable (e.g. 50 frames / ~0.6s)
-                samples_per_frame = 320  # 24000 / 75
-                context_window = 60
-
-                
-                # Calculate window based on current step t
-                # We want the window to end at t + 2
+                # Use full buffer decoding (stable) instead of sliding window
                 end_pos = t + 2
-                decode_start_frame = max(0, end_pos - context_window)
+                delayed_tokens = audio_buf[0, :, :end_pos].clone()
                 
-                delayed_tokens = audio_buf[0, :, decode_start_frame:end_pos].clone()
-                
-                print(f"[Dia2] Debug: t={t}, decode_start={decode_start_frame}, end_pos={end_pos}, raw_len={delayed_tokens.shape[-1]}")
-                # Safety: Pad with silence if context is too short for Mimi (prevents kernel size error)
-                min_context = max_delay + 50  # Increase safety margin to 50 frames (~0.6s)
-                min_context = max_delay + 32  # Ensure enough frames remain after undelay
-                if delayed_tokens.shape[-1] < min_context:
-                    pad_amt = min_context - delayed_tokens.shape[-1]
-                    delayed_tokens = F.pad(delayed_tokens, (pad_amt, 0), value=token_ids.audio_pad)
-
                 aligned = undelay_frames(
                     delayed_tokens,
                     runtime.audio_delays,
                     token_ids.audio_pad
                 ).unsqueeze(0)
                 
-                print(f"[Dia2] Debug: padded_len={delayed_tokens.shape[-1]}, aligned_len={aligned.shape[-1]}")
-                
                 # Safety clamp
                 aligned = torch.clamp(aligned, 0, 2047)
-                
-                if aligned.shape[-1] < 16:
-                    print(f"[Dia2] Warning: Aligned length {aligned.shape[-1]} too short for Mimi, skipping decode")
-                    continue
                 
                 torch.cuda.synchronize()
                 pcm = runtime.mimi.decode(aligned)
                 full_waveform = torch.clamp(pcm[0, 0], -1.0, 1.0)
                 
-                # Calculate where we are in the stream relative to this slice
-                slice_start_sample = decode_start_frame * samples_per_frame
-                current_offset = total_samples_output - slice_start_sample
-                
-                if full_waveform.shape[0] > current_offset:
-                    waveform = full_waveform[current_offset:]
+                if full_waveform.shape[0] > total_samples_output:
+                    waveform = full_waveform[total_samples_output:]
                     
                     if waveform.shape[0] > 0:
                         if chunks_sent == 0:

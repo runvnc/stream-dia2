@@ -102,3 +102,11 @@ The next agent should focus on reducing the **buffering delay** without breaking
 4.  **Performance:**
     -   First audio: ~100ms.
     -   Generation speed: ~25ms/frame (faster than real-time).
+
+## Update: Reverted to Stable Low-Latency Architecture
+**Date:** 2025-12-11
+**Status:** Stable (<150ms latency)
+**Architecture:**
+1.  **Cached Prefix:** Preserved. Provides instant start.
+2.  **Prefix Exclusion:** Preserved. Prefix text is removed from state machine to prevent repetition.
+3.  **Decoding:** Reverted to **Full Buffer Decoding**. The "Sliding Window" optimization was causing instability (Mimi kernel errors due to invalid window calculation) and has been removed. The generation speed is sufficient that full decoding is acceptable for standard sentence lengths.
