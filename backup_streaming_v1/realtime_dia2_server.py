@@ -510,7 +510,8 @@ def _run_tts(
                 # Safety: Ensure window is valid for undelay_frames (must have > max_delay frames)
                 # end_pos - start must be > max_delay
                 # start < end_pos - max_delay
-                max_start = max(0, end_pos - (max_delay + 1))
+                # Use max_delay + 8 to be safe for Mimi kernel sizes
+                max_start = max(0, end_pos - (max_delay + 8))
                 decode_start_frame = min(decode_start_frame, max_start)
                 
                 decode_start_frame = min(decode_start_frame, t)  # Safety: never start after current frame
