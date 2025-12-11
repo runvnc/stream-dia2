@@ -287,6 +287,30 @@ def _create_session() -> VoiceSession:
         start_step = warmup_with_prefix(runtime, prefix_plan, state, gen_state)
         print(f"[Dia2] Warmup complete. Aligned frames: {prefix_plan.aligned_frames}, Start step: {start_step}")
         
+        # --- 3. Cool-down Phase (Force Silence) ---
+        # Run a few frames of silence to settle the model state into a "finished" mode.
+        # This prevents the momentum of the prefix speech from leaking into the new generation.
+        print("[Dia2] Running cool-down phase (20 frames)...")
+        cooldown_frames = 20
+        
+        # Set inputs to PAD/SILENCE
+        gen_state.step_tokens[:, 0, 0] = token_ids.pad
+        gen_state.step_tokens[:, 1, 0] = token_ids.pad
+        # Force audio history to BOS (silence) for these frames
+        gen_state.step_tokens[:, 2:, 0] = token_ids.audio_bos
+        
+        with torch.inference_mode():
+            for _ in range(cooldown_frames):
+                t = start_step + 1
+                positions.fill_(t)
+                
+                # Run transformer (updates KV cache)
+                transformer_capture[0].replay()
+                
+                # Update audio buffer with silence (BOS)
+                gen_state.audio_buf[:, :, t + 1] = token_ids.audio_bos
+                start_step += 1
+        
         # Save snapshot
         kv_snapshot = []
         for slot in gen_state.decode.transformer.slots:
