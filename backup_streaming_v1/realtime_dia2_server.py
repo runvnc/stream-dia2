@@ -473,6 +473,11 @@ def _run_tts(
             positions.fill_(t)
             _fill_audio_channels(step_tokens, audio_buf, delay_tensor, t, token_ids.audio_bos)
             
+            # FIX: Force audio channels to BOS at the start to break context from prefix
+            # This prevents the model from continuing the prefix audio/text pattern
+            if t == start_step:
+                step_tokens[:, 2:, 0] = token_ids.audio_bos
+
             if branches > 1:
                 step_tokens[1:, 0, 0] = token_ids.zero
                 step_tokens[1:, 1, 0] = token_ids.pad
