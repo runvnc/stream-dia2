@@ -1,4 +1,5 @@
 """Dia2 Streaming TTS Server with persistent connections and voice conditioning."""
+import argparse
 import asyncio
 import base64
 import json
@@ -15,6 +16,25 @@ import numpy as np
 import torch
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
+
+# Parse args early so seed can be set before model load
+def _parse_args():
+    parser = argparse.ArgumentParser(description="Dia2 Streaming TTS Server")
+    parser.add_argument("--port", type=int, default=3030, help="Server port")
+    parser.add_argument("--host", type=str, default="0.0.0.0", help="Server host")
+    parser.add_argument("--seed", type=int, help="Random seed for reproducible generation")
+    # Only parse known args to avoid conflicts with uvicorn
+    args, _ = parser.parse_known_args()
+    return args
+
+_args = _parse_args()
+
+# Set seed BEFORE model loading
+if _args.seed is not None:
+    print(f"[Dia2] Setting random seed to {_args.seed}")
+    torch.manual_seed(_args.seed)
+    torch.cuda.manual_seed(_args.seed)
+    np.random.seed(_args.seed)
 
 from dia2 import Dia2, GenerationConfig, SamplingConfig
 from dia2.runtime.generator import build_initial_state, warmup_with_prefix
@@ -38,9 +58,21 @@ _cuda_executor = ThreadPoolExecutor(max_workers=1)
 # Cache for prefix plans (keyed by hash of voice file paths)
 _prefix_cache: Dict[str, Any] = {}
 
+# Store seed for use in generation
+_global_seed = _args.seed
+
+
+def _set_seed_if_needed():
+    """Reset seed before each generation for reproducibility."""
+    if _global_seed is not None:
+        torch.manual_seed(_global_seed)
+        torch.cuda.manual_seed(_global_seed)
+        np.random.seed(_global_seed)
+
 
 def _warmup_model() -> None:
     try:
+        _set_seed_if_needed()
         cfg = GenerationConfig(
             cfg_scale=2.0,
             text=SamplingConfig(temperature=0.6, top_k=50),
@@ -128,6 +160,8 @@ def _run_streaming_generation(
 ) -> None:
     """Run streaming generation and put chunks into the queue."""
     try:
+        _set_seed_if_needed()  # Reset seed for reproducible generation
+        
         print(f"[Dia2] Generating: {text[:50]}...")
         runtime = dia._ensure_runtime()
         
@@ -383,20 +417,6 @@ async def stream_tts(ws: WebSocket):
 
 
 if __name__ == "__main__":
-    import argparse
     import uvicorn
-    
-    parser = argparse.ArgumentParser(description="Dia2 Streaming TTS Server")
-    parser.add_argument("--port", type=int, default=3030, help="Server port")
-    parser.add_argument("--host", type=str, default="0.0.0.0", help="Server host")
-    parser.add_argument("--seed", type=int, help="Random seed for reproducible generation")
-    args = parser.parse_args()
-    
-    if args.seed is not None:
-        print(f"[Dia2] Setting random seed to {args.seed}")
-        torch.manual_seed(args.seed)
-        torch.cuda.manual_seed(args.seed)
-        np.random.seed(args.seed)
-    
-    print(f"[Dia2] Starting server on {args.host}:{args.port}")
-    uvicorn.run(app, host=args.host, port=args.port)
+    print(f"[Dia2] Starting server on {_args.host}:{_args.port}")
+    uvicorn.run(app, host=_args.host, port=_args.port)
