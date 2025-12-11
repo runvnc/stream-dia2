@@ -393,6 +393,17 @@ def _run_tts(
         chunks_sent = 0
         fade_samples = 4800  # ~200ms at 24kHz
         
+        # If we have a prefix, calculate its length in samples so we can skip it in output
+        if start_step > 0:
+            # Decode prefix to establish baseline
+            prefix_end = start_step + 1
+            prefix_tokens = audio_buf[0, :, :prefix_end].clone()
+            aligned = undelay_frames(prefix_tokens, runtime.audio_delays, token_ids.audio_pad).unsqueeze(0)
+            with torch.inference_mode():
+                pcm = runtime.mimi.decode(aligned.to(runtime.device))
+                total_samples_output = pcm.shape[-1]
+            print(f"[Dia2] Prefix length: {total_samples_output} samples. Skipping these in output.")
+        
         # Reset seed for consistent voice if specified
         if _args.seed is not None:
             torch.manual_seed(_args.seed)
@@ -468,13 +479,13 @@ def _run_tts(
             is_final = (eos_cutoff is not None and t + 1 >= eos_cutoff)
             
             # Decode when we have enough frames
-            # Strategy: Wait for full alignment (max_delay + 1) to ensure clean audio.
-            frames_before_decode = max_delay + 1
+            # Strategy: If we have prefix, we can decode immediately. Otherwise wait for buffer.
+            frames_before_decode = 1 if start_step > 0 else (max_delay + 1)
             should_decode = (frames_generated >= frames_before_decode) or is_final
             
             if should_decode:
                 # Undelay and decode
-                end_pos = frames_generated + 1
+                end_pos = t + 2
                 delayed_tokens = audio_buf[0, :, :end_pos].clone()
                 
                 aligned = undelay_frames(
