@@ -78,7 +78,7 @@ def _warmup_model() -> None:
             cfg_scale=1.0,
             text=SamplingConfig(temperature=0.6, top_k=50),
             audio=SamplingConfig(temperature=0.8, top_k=50),
-            use_cuda_graph=False,  # Disable graphs for lower latency
+            use_cuda_graph=True,  # Enable for faster generation
         )
         print("[Dia2] Running STREAMING warm-up generation...")
         
@@ -189,7 +189,7 @@ def _run_streaming_generation(
             cfg_scale=cfg_scale,
             text=SamplingConfig(temperature=temperature, top_k=top_k),
             audio=SamplingConfig(temperature=temperature, top_k=top_k),
-            use_cuda_graph=False,  # Disable graphs for lower first-frame latency
+            use_cuda_graph=True,  # Enable for faster generation
         )
         
         # Get cached prefix plan

@@ -134,16 +134,20 @@ def run_streaming_generation(
     if use_graph:
         _ensure_graph_cublas_ready(runtime.device)
     
-    # Streaming state
     sample_rate = runtime.mimi.sample_rate
     samples_per_frame = runtime.mimi.samples_per_frame
     
-    # Skip a small number of initial samples to avoid any startup transients.
-    # Previously this was max_delay * samples_per_frame which was way too much
-    # (skipping 1.4s out of 1.7s of audio!). Just skip ~2 frames worth.
+    # We need to buffer max_delay frames before we can produce aligned output.
+    # The delay pattern means codebook N is offset by delays[N] frames.
+    # undelay_frames() shifts them back into alignment, but requires max_delay
+    # extra frames of context.
+    frames_before_decode = max_delay + 1  # Need this many frames before first decode
+    
     mimi_kv = None
-    samples_to_skip = 2 * samples_per_frame  # ~160ms at 24kHz
-    print(f"[streaming] max_delay={max_delay}, samples_to_skip={samples_to_skip}")
+    samples_to_skip = 0  # No longer needed - undelay_frames handles alignment
+    
+    print(f"[streaming] max_delay={max_delay}, frames_before_decode={frames_before_decode}")
+
     
     first_frame_time = None
     first_audio_time = None
@@ -156,8 +160,8 @@ def run_streaming_generation(
     total_samples_output = 0
     samples_skipped = 0
     
-    # Track decode position - we decode from start_step onwards
-    last_decode_pos = start_step + 1
+    # Track how many frames we've generated (for buffering before first decode)
+    frames_generated = 0
     
     with torch.inference_mode():
         for offset in range(max_context):
@@ -278,7 +282,7 @@ def run_streaming_generation(
                 audio_buf[:, stage + 1, t + 1] = stage_token
                 prev_audio = stage_token.expand(branches)
             
-            frames_generated += 1
+            frames_generated = offset + 1
             
             if first_frame_time is None:
                 first_frame_time = time.perf_counter()
@@ -287,47 +291,43 @@ def run_streaming_generation(
             if eos_cutoff is None and state.end_step is not None:
                 eos_cutoff = state.end_step + flush_tail
             
-            # Current position is t+1 (we just generated it)
-            current_pos = t + 2  # +2 because we store at t+1 and want to decode up to and including it
-            frames_to_decode = current_pos - last_decode_pos
-            
             is_final = (eos_cutoff is not None and t + 1 >= eos_cutoff) or (t + 2 >= audio_buf.shape[-1])
             
-            # Decode every chunk_frames, or on final
-            should_decode = frames_to_decode >= chunk_frames or (is_final and frames_to_decode > 0)
+            # We need max_delay+1 frames before we can produce any aligned output
+            # After that, decode every chunk_frames
+            can_decode = frames_generated >= frames_before_decode
+            should_decode = can_decode and (frames_generated % chunk_frames == 0 or is_final)
             
             if should_decode:
-                # Get the new frames (delayed tokens, no undelaying)
-                new_tokens = audio_buf[0:1, :, last_decode_pos:current_pos].clone()
+                # Get all generated frames and undelay them to align codebooks
+                end_pos = start_step + frames_generated + 1
+                delayed_tokens = audio_buf[0, :, start_step:end_pos].clone()
                 
-                # Sanitize tokens for Mimi (replace special tokens like pad/bos/ungenerated with 0)
-                # Mimi expects [0, 2047].
-                new_tokens[new_tokens >= 2048] = 0
-                new_tokens[new_tokens < 0] = 0
+                # Undelay to align codebooks - this produces (frames_generated - max_delay) aligned frames
+                aligned_tokens = undelay_frames(
+                    delayed_tokens,
+                    runtime.audio_delays,
+                    token_ids.audio_pad
+                ).unsqueeze(0)  # Add batch dim
                 
-                # Decode with Mimi streaming
-                pcm, mimi_kv = runtime.mimi.decode_streaming(new_tokens, mimi_kv)
+                # Sanitize tokens for Mimi
+                aligned_tokens[aligned_tokens >= 2048] = 0
+                aligned_tokens[aligned_tokens < 0] = 0
                 
-                if cached_graphs is not None:
-                    cached_graphs.mimi_kv = mimi_kv
-                    
-                waveform = torch.clamp(pcm[0, 0], -1.0, 1.0)
+                # Decode with Mimi (batch decode for now - simpler and correct)
+                with torch.inference_mode():
+                    pcm = runtime.mimi.decode(aligned_tokens)
+                
+                full_waveform = torch.clamp(pcm[0, 0], -1.0, 1.0)
                 
                 # Force GPU to complete this frame before yielding for true streaming
                 torch.cuda.synchronize()
                 
-                # Skip prefix samples due to delay pattern
-                if samples_skipped < samples_to_skip:
-                    remaining_to_skip = samples_to_skip - samples_skipped
-                    if waveform.shape[0] <= remaining_to_skip:
-                        # Skip entire chunk
-                        samples_skipped += waveform.shape[0]
-                        last_decode_pos = current_pos
-                        continue
-                    else:
-                        # Skip partial, output rest
-                        waveform = waveform[remaining_to_skip:]
-                        samples_skipped = samples_to_skip
+                # Only output new samples (not ones we've already sent)
+                if full_waveform.shape[0] > total_samples_output:
+                    waveform = full_waveform[total_samples_output:]
+                else:
+                    waveform = torch.tensor([], device=runtime.device)
                 
                 if waveform.shape[0] > 0:
                     if first_audio_time is None:
@@ -340,12 +340,10 @@ def run_streaming_generation(
                     yield StreamingChunk(
                         waveform=waveform,
                         sample_rate=sample_rate,
-                        frame_start=last_decode_pos,
-                        frame_end=current_pos,
+                        frame_start=start_step,
+                        frame_end=start_step + frames_generated,
                         is_final=is_final,
                     )
-                
-                last_decode_pos = current_pos
                 
                 if is_final:
                     break
