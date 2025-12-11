@@ -282,9 +282,6 @@ def run_streaming_generation(
                 audio_buf[:, stage + 1, t + 1] = stage_token
                 prev_audio = stage_token.expand(branches)
             
-            # Sync after each frame to ensure GPU work is complete
-            torch.cuda.synchronize()
-            
             frames_generated = offset + 1
             frame_time = time.perf_counter()
             
@@ -312,6 +309,9 @@ def run_streaming_generation(
                 delayed_tokens = audio_buf[0, :, start_step:end_pos].clone()
                 
                 # Undelay to align codebooks - this produces (frames_generated - max_delay) aligned frames
+                # Sync before decode to ensure all generation work is complete
+                torch.cuda.synchronize()
+                
                 aligned_tokens = undelay_frames(
                     delayed_tokens,
                     runtime.audio_delays,
