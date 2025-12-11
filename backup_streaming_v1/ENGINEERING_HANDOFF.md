@@ -66,3 +66,12 @@ The next agent should focus on reducing the **buffering delay** without breaking
 **Changes:**
 - **Voice Consistency:** Added logic to reset the random seed (if provided via `--seed`) at the start of *every* request. This ensures the same "random" voice is generated for every connection.
 - **Audio Quality:** Increased initial buffer from 3 frames to **15 frames** (~375ms). This eliminates the "unusable" start by providing sufficient context for the vocoder while keeping latency under 500ms.
+
+## Update: Minimized Latency & Chunk Size
+**Date:** 2025-12-11
+**Status:** Implemented
+**Changes:**
+- **Decode Frequency:** Changed from decoding every 3 frames to **every frame** once the buffer is full.
+- **Impact:** 
+  1. Reduces first-chunk latency by eliminating the wait for the next multiple of 3 (saves ~50-100ms).
+  2. Produces the smallest possible audio chunks (1 frame / ~20ms), which results in smoother streaming and prevents the "bursty" large chunks you observed.

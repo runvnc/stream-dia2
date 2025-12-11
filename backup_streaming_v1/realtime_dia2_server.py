@@ -277,6 +277,7 @@ def _run_tts(
         frames_generated = 0
         total_samples_output = 0
         chunks_sent = 0
+        fade_samples = 4800  # ~200ms at 24kHz
         
         # Reset seed for consistent voice if specified
         if _args.seed is not None:
@@ -351,16 +352,20 @@ def _run_tts(
             is_final = (eos_cutoff is not None and t + 1 >= eos_cutoff)
             
             # Decode when we have enough frames
-            # Strategy: Wait for full alignment (max_delay + 1) to ensure clean audio.
-            # With ~25ms/frame generation, 19 frames is ~475ms latency.
-            frames_before_decode = max_delay + 1
-            should_decode = (frames_generated >= frames_before_decode) or is_final
+            # Strategy: Decode early (10 frames) with silence padding + fade-in to mask artifacts
+            min_frames = 10
+            should_decode = (frames_generated >= min_frames) or is_final
             
             if should_decode:
                 # Undelay and decode
                 end_pos = frames_generated + 1
                 delayed_tokens = audio_buf[0, :, :end_pos].clone()
                 
+                # Pad with silence if we don't have enough frames for max_delay
+                if delayed_tokens.shape[-1] <= max_delay:
+                    pad_amt = (max_delay + 1) - delayed_tokens.shape[-1]
+                    delayed_tokens = F.pad(delayed_tokens, (0, pad_amt), value=token_ids.audio_pad)
+
                 aligned = undelay_frames(
                     delayed_tokens,
                     runtime.audio_delays,
@@ -376,6 +381,17 @@ def _run_tts(
                 
                 if full_waveform.shape[0] > total_samples_output:
                     waveform = full_waveform[total_samples_output:]
+                    
+                    # Apply fade-in to the very first samples to mask artifacts
+                    if total_samples_output < fade_samples:
+                        # Calculate how much of this chunk needs fading
+                        start_idx = total_samples_output
+                        end_idx = start_idx + waveform.shape[0]
+                        if start_idx < fade_samples:
+                            fade_len = min(end_idx, fade_samples) - start_idx
+                            # Linear fade ramp
+                            ramp = torch.linspace(start_idx/fade_samples, (start_idx+fade_len)/fade_samples, fade_len, device=waveform.device)
+                            waveform[:fade_len] *= ramp
                     
                     if waveform.shape[0] > 0:
                         if chunks_sent == 0:
