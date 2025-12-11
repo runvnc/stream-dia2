@@ -28,7 +28,7 @@ def _parse_args():
     parser = argparse.ArgumentParser(description="Dia2 Streaming TTS Server")
     parser.add_argument("--port", type=int, default=3030, help="Server port")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Server host")
-    parser.add_argument("--prefix-audio", type=str, default="/files/dia2stream/seed42a1.wav", help="Path to prefix audio for voice cloning")
+    parser.add_argument("--prefix-audio", type=str, default="s1.mp3", help="Path to prefix audio for voice cloning")
     parser.add_argument("--seed", type=int, help="Random seed for reproducible generation")
     args, _ = parser.parse_known_args()
     return args
