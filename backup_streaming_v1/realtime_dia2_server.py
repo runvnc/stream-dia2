@@ -396,6 +396,10 @@ def _run_tts(
             runtime.frame_rate
         ))
         
+        # FIX: Remove padding from the first entry to ensure immediate speaker switch
+        if new_entries:
+            new_entries[0].padding = 0
+        
         # ONLY use new entries. The prefix is already in the model's KV cache.
         entries = new_entries
         print(f"Entries:", entries) 
@@ -480,8 +484,14 @@ def _run_tts(
             guided_text = apply_classifier_guidance(buffers.text, False, 1.0, 50)
             text_token = sample_token(guided_text[:1], temp=temperature, top_k=top_k).item()
             
+            # Force new_word at the start to ensure we switch to the new text immediately
+            is_forced = False
+            if t == start_step:
+                text_token = token_ids.new_word
+                is_forced = True
+
             # State machine
-            main_token, aux_token, _ = runtime.machine.process(t, state, text_token)
+            main_token, aux_token, _ = runtime.machine.process(t, state, text_token, is_forced=is_forced)
             step_tokens[:, 0, 0] = main_token
             step_tokens[:, 1, 0] = aux_token if aux_token != -1 else token_ids.pad
             
