@@ -282,6 +282,9 @@ def run_streaming_generation(
                 audio_buf[:, stage + 1, t + 1] = stage_token
                 prev_audio = stage_token.expand(branches)
             
+            # Sync after each frame to ensure true streaming (not batching all GPU work)
+            torch.cuda.synchronize()
+            
             frames_generated = offset + 1
             
             if first_frame_time is None:
@@ -319,9 +322,6 @@ def run_streaming_generation(
                     pcm = runtime.mimi.decode(aligned_tokens)
                 
                 full_waveform = torch.clamp(pcm[0, 0], -1.0, 1.0)
-                
-                # Force GPU to complete this frame before yielding for true streaming
-                torch.cuda.synchronize()
                 
                 # Only output new samples (not ones we've already sent)
                 if full_waveform.shape[0] > total_samples_output:
