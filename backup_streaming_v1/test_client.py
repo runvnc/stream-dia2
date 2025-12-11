@@ -16,7 +16,7 @@ except ImportError:
     HAS_AUDIO = False
     print("[warn] sounddevice not available, audio playback disabled")
 
-WS_URL = "ws://localhost:3030/ws/stream_tts"
+WS_URL = "wss://i9981txmurahrf-3030.proxy.runpod.net/ws/stream_tts"
 SAMPLE_RATE = 24000
 
 
