@@ -79,7 +79,6 @@ def build_runtime(
     device_obj = torch.device(device)
     if device_obj.type == "cuda":
         cuda_matmul = torch.backends.cuda.matmul
-        cudnn_conv = torch.backends.cudnn.conv
         if hasattr(cuda_matmul, "fp32_precision"):
             cuda_matmul.fp32_precision = "tf32"
             with warnings.catch_warnings():
@@ -90,15 +89,8 @@ def build_runtime(
                 torch.backends.cuda.matmul.allow_tf32 = True
         else:  # pragma: no cover - compatibility with older PyTorch
             torch.backends.cuda.matmul.allow_tf32 = True
-        if hasattr(cudnn_conv, "fp32_precision"):
-            cudnn_conv.fp32_precision = "tf32"
-            with warnings.catch_warnings():
-                warnings.filterwarnings(
-                    "ignore",
-                    message="Please use the new API settings",
-                )
-                torch.backends.cudnn.allow_tf32 = True
-        else:  # pragma: no cover
+        # Enable TF32 for cudnn (simpler approach that works across PyTorch versions)
+        if hasattr(torch.backends.cudnn, "allow_tf32"):
             torch.backends.cudnn.allow_tf32 = True
     precision = resolve_precision(dtype_pref, device_obj)
     config = load_config(config_path)
