@@ -446,13 +446,25 @@ def _run_tts(
 
         # FIX: Clear residual text tokens from prefix to prevent hallucination
         # This ensures the first transformer pass sees a 'new_word' token instead of the last prefix token
-        # We set it to 'new_word' to match the state machine's expectation for the start of new text.
+        # User requested to "put the tokens for the actual text in step_tokens".
+        # We teacher-force the first token (e.g. [S1]) to align the model immediately.
         step_tokens.fill_(runtime.constants.pad)
-        step_tokens[:, 0, 0] = runtime.constants.new_word
         
-        # Pre-advance the state machine to acknowledge this 'new_word'
-        # This loads the first text entry into the pending queue so the model's next prediction ([S1]) is accepted.
+        # 1. Advance state machine to load the new entry (consumes new_word)
         runtime.machine.process(start_step - 1, state, runtime.constants.new_word, is_forced=True)
+
+        # 2. Get the first actual token (e.g. [S1]) and set it as input
+        if entries and entries[0].tokens:
+            first_token = entries[0].tokens[0]
+            step_tokens[:, 0, 0] = first_token
+            # 3. Consume it from the pending queue so the state machine expects the *next* token (e.g. "Hi")
+            if state.pending_tokens and state.pending_tokens[0] == first_token:
+                state.pending_tokens.popleft()
+        else:
+            step_tokens[:, 0, 0] = runtime.constants.new_word
+            
+        # 4. Force audio history to silence to prevent "machine gun" artifacts from dirty buffer
+        step_tokens[:, 2:, 0] = token_ids.audio_bos
 
         token_ids = runtime.constants
         delay_tensor = runtime.audio_delay_tensor
