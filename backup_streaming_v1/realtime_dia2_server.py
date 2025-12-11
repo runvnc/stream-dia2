@@ -440,13 +440,13 @@ def _run_tts(
 
         # FIX: Clear residual text tokens from prefix to prevent hallucination
         # This ensures the first transformer pass sees a 'new_word' token instead of the last prefix token
-        # User requested to "completely clear" it. We reset to initial state (BOS/PAD).
-        # This matches build_initial_state() logic.
+        # We set it to 'new_word' to match the state machine's expectation for the start of new text.
         step_tokens.fill_(runtime.constants.pad)
-        step_tokens[0, 0, 0] = runtime.constants.bos
-        step_tokens[0, 1, 0] = runtime.constants.pad
-        if branches > 1:
-            step_tokens[1, 0, 0] = runtime.constants.zero
+        step_tokens[:, 0, 0] = runtime.constants.new_word
+        
+        # Pre-advance the state machine to acknowledge this 'new_word'
+        # This loads the first text entry into the pending queue so the model's next prediction ([S1]) is accepted.
+        runtime.machine.process(start_step - 1, state, runtime.constants.new_word, is_forced=True)
 
         token_ids = runtime.constants
         delay_tensor = runtime.audio_delay_tensor
@@ -520,14 +520,8 @@ def _run_tts(
             guided_text = apply_classifier_guidance(buffers.text, False, 1.0, 50)
             text_token = sample_token(guided_text[:1], temp=temperature, top_k=top_k).item()
             
-            # Force new_word at the start to ensure we switch to the new text immediately
-            is_forced = False
-            if t == start_step:
-                text_token = token_ids.new_word
-                is_forced = True
-
             # State machine
-            main_token, aux_token, _ = runtime.machine.process(t, state, text_token, is_forced=is_forced)
+            main_token, aux_token, _ = runtime.machine.process(t, state, text_token)
             step_tokens[:, 0, 0] = main_token
             step_tokens[:, 1, 0] = aux_token if aux_token != -1 else token_ids.pad
             
