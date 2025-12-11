@@ -498,6 +498,13 @@ def _run_tts(
             should_decode = (frames_generated >= frames_before_decode) or is_final
             
             if should_decode:
+                # Check if we have enough frames for Mimi to be stable
+                # Mimi needs a minimum context (e.g. 16 frames) to avoid kernel size errors
+                # aligned_len = (t + 2) - decode_start_frame - max_delay
+                # We can just check the raw buffer length available
+                if (t + 2) < (max_delay + 16):
+                    continue
+
                 # Undelay and decode
                 # OPTIMIZATION: Use a sliding window to avoid re-decoding the entire history
                 # We need some context for the vocoder to be stable (e.g. 50 frames / ~0.6s)
