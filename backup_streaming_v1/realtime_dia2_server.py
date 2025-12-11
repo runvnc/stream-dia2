@@ -32,6 +32,7 @@ import torch
 import torch.nn.functional as F
 import soundfile as sf  # Explicit import for robustness
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 
 # Parse args early
 def _parse_args():
@@ -73,6 +74,14 @@ from dia2.runtime.sampler import sample_token
 from dia2.audio.grid import mask_audio_logits, undelay_frames, delay_frames
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 MODEL_REPO = "nari-labs/Dia2-2B"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
