@@ -34,6 +34,24 @@ import soundfile as sf  # Explicit import for robustness
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
+
+# Mimi/Dia2 codebook tokens are 0..2047. Any >=2048 are special (bos/pad) and must not reach Mimi decode.
+MIMI_CODEBOOK_SIZE = 2048
+
+
+def _sanitize_mimi_tokens(tokens: torch.Tensor) -> torch.Tensor:
+    """Map any invalid/special tokens to 0 before Mimi decode.
+
+    Mimi expects codebook IDs in [0..2047]. Dia2 runtime may contain special IDs
+    like audio_bos/audio_pad (often 2048/2049) in delayed grids.
+    """
+    # Operate in-place when possible
+    if tokens.dtype != torch.long:
+        tokens = tokens.long()
+    tokens[tokens < 0] = 0
+    tokens[tokens >= MIMI_CODEBOOK_SIZE] = 0
+    return tokens
+
 # Parse args early
 def _parse_args():
     parser = argparse.ArgumentParser(description="Dia2 Streaming TTS Server")
@@ -42,10 +60,32 @@ def _parse_args():
     parser.add_argument("--prefix-audio", type=str, default=os.path.abspath("prefix.wav"), help="Path to prefix audio for voice cloning")
     parser.add_argument("--prefix-speaker-2", type=str, default=None, help="Path to prefix audio for Speaker 2")
     parser.add_argument("--seed", type=int, help="Random seed for reproducible generation")
+    parser.add_argument("--cuda-debug", action="store_true", help="Extra CUDA sync + asserts for debugging device-side asserts")
     args, _ = parser.parse_known_args()
     return args
 
 _args = _parse_args()
+
+
+def _cuda_dbg_sync(label: str) -> None:
+    if not getattr(_args, "cuda_debug", False):
+        return
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    print(f"[Dia2][cuda-debug] sync: {label}")
+
+
+def _cuda_dbg_check_audio_token_range(label: str, t: torch.Tensor) -> None:
+    """Debug-only guard: ensure any audio tokens intended for Depformer/Mimi are within 0..2047."""
+    if not getattr(_args, "cuda_debug", False):
+        return
+    if t.numel() == 0:
+        return
+    # These reductions are expensive; only run when explicitly enabled.
+    tmin = int(t.min().item())
+    tmax = int(t.max().item())
+    if tmin < 0 or tmax >= MIMI_CODEBOOK_SIZE:
+        raise RuntimeError(f"[Dia2][cuda-debug] {label}: audio token out of range: min={tmin} max={tmax} (expected 0..{MIMI_CODEBOOK_SIZE-1})")
 
 if _args.seed is not None:
     print(f"[Dia2] Setting random seed to {_args.seed}")
@@ -165,6 +205,7 @@ def _create_session() -> VoiceSession:
     
     # Run 30 frames to capture all graphs
     for t in range(30):
+        _cuda_dbg_sync(f"graph-capture:pre-step t={t}")
         gen_state.reset_dep_cache()
         positions.fill_(t)
         _fill_audio_channels(step_tokens, audio_buf, delay_tensor, t, token_ids.audio_bos)
@@ -197,6 +238,7 @@ def _create_session() -> VoiceSession:
         guided_cb0 = apply_classifier_guidance(buffers.cb0, False, 1.0, 50)
         masked_cb0 = mask_audio_logits(guided_cb0[:1], token_ids.audio_pad, token_ids.audio_bos)
         codebook_token = sample_audio_logits(masked_cb0, 0.8, 50)
+        _cuda_dbg_check_audio_token_range(f"graph-capture:cb0 t={t}", codebook_token)
         audio_buf[:, 0, t + 1] = codebook_token
         
         prev_audio = codebook_token.expand(branches)
@@ -219,6 +261,7 @@ def _create_session() -> VoiceSession:
             
             dep_logits = apply_classifier_guidance(buffers.dep[stage], False, 1.0, 50)
             stage_token = sample_audio_logits(dep_logits[:1], 0.8, 50)
+            _cuda_dbg_check_audio_token_range(f"graph-capture:dep stage={stage} t={t}", stage_token)
             audio_buf[:, stage + 1, t + 1] = stage_token
             prev_audio = stage_token.expand(branches)
     
@@ -290,25 +333,33 @@ def _create_session() -> VoiceSession:
         # --- 3. Cool-down Phase (Force Silence) ---
         # Run a few frames of silence to settle the model state into a "finished" mode.
         # This prevents the momentum of the prefix speech from leaking into the new generation.
-        print("[Dia2] Running cool-down phase (20 frames)...")
-        cooldown_frames = 20
-        
-        # Set inputs to PAD/SILENCE
-        gen_state.step_tokens[:, 0, 0] = token_ids.pad
-        gen_state.step_tokens[:, 1, 0] = token_ids.pad
-        # Force audio history to BOS (silence) for these frames
-        gen_state.step_tokens[:, 2:, 0] = token_ids.audio_bos
+        # NOTE: This is a *KV stabilization* phase. We keep it short to avoid adding audible latency.
+        # With 75 fps, 6 frames ~= 80ms.
+        print("[Dia2] Running cool-down phase (6 frames)...")
+        cooldown_frames = 6
         
         with torch.inference_mode():
             for _ in range(cooldown_frames):
                 t = start_step + 1
+                if t + 1 >= gen_state.audio_buf.shape[-1]:
+                    break
                 positions.fill_(t)
-                
+
+                # Feed PAD on text streams (valid text vocab) and audio_bos on audio-history channels.
+                # audio_bos is a Dia2 special token (often 2048); it is safe for transformer embeddings.
+                gen_state.step_tokens[:, 0, 0] = token_ids.pad
+                gen_state.step_tokens[:, 1, 0] = token_ids.pad
+                gen_state.step_tokens[:, 2:, 0] = token_ids.audio_bos
+                if branches > 1:
+                    gen_state.step_tokens[1:, 0, 0] = token_ids.zero
+                    gen_state.step_tokens[1:, 1, 0] = token_ids.pad
+
+                # Ensure subsequent frames also see a clean, silent-ish audio history.
+                gen_state.audio_buf[:, :, t] = token_ids.audio_bos
+                gen_state.audio_buf[:, :, t + 1] = token_ids.audio_bos
+
                 # Run transformer (updates KV cache)
                 transformer_capture[0].replay()
-                
-                # Update audio buffer with silence (BOS)
-                gen_state.audio_buf[:, :, t + 1] = token_ids.audio_bos
                 start_step += 1
         
         # Save snapshot
@@ -449,39 +500,10 @@ def _run_tts(
             start_step = session.snapshot.start_step
             print(f"[Dia2] Resuming from cached state at step {start_step}")
 
-        # FIX: Clear residual text tokens from prefix to prevent hallucination
-        # This ensures the first transformer pass sees a 'new_word' token instead of the last prefix token
-        # User requested to "put ALL of the tokens for the requested speech in step_tokens".
-        # We populate both Main and Aux channels to give full context.
-        step_tokens.fill_(runtime.constants.pad)
-        
-        # 1. Advance state machine to load the new entry (consumes new_word)
-        runtime.machine.process(start_step - 1, state, runtime.constants.new_word, is_forced=True)
-
-        # 2. Populate step_tokens with the first AND second tokens (Main + Aux)
-        if entries and entries[0].tokens:
-            first_token = entries[0].tokens[0]
-            step_tokens[:, 0, 0] = first_token
-            
-            # FIX: Also set the auxiliary (lookahead) token so the model knows what comes next
-            # If we leave this as PAD, the model thinks the sentence ends at [S1]
-            second_token = token_ids.pad
-            if len(entries[0].tokens) > 1:
-                second_token = entries[0].tokens[1]
-            step_tokens[:, 1, 0] = second_token
-            
-            
-            # Consume first token from pending so machine is in sync
-            if state.pending_tokens and state.pending_tokens[0] == first_token:
-                state.pending_tokens.popleft()
-
-            # If there is a second token (e.g. "Hi"), put it in the Aux channel (Channel 1)
-            if state.pending_tokens:
-                second_token = state.pending_tokens[0]
-                step_tokens[:, 1, 0] = second_token
-        else:
-            step_tokens[:, 0, 0] = runtime.constants.new_word
-            step_tokens[:, 1, 0] = runtime.constants.pad
+        # IMPORTANT:
+        # Do NOT teacher-force raw word-piece tokens into step_tokens here.
+        # Dia2 is trained on an action-level interface (pad/new_word) feeding a state machine.
+        # We keep the snapshot step_tokens as-is and let the normal loop drive the choreography.
 
         print(f"[Dia2] max_delay: {max_delay} frames")
         
@@ -527,11 +549,6 @@ def _run_tts(
             gen.reset_dep_cache()
             positions.fill_(t)
             _fill_audio_channels(step_tokens, audio_buf, delay_tensor, t, token_ids.audio_bos)
-            
-            # FIX: Force audio channels to BOS at the start to break context from prefix
-            # This prevents the model from continuing the prefix audio/text pattern
-            if t == start_step:
-                step_tokens[:, 2:, 0] = token_ids.audio_bos
 
             if branches > 1:
                 step_tokens[1:, 0, 0] = token_ids.zero
@@ -544,6 +561,11 @@ def _run_tts(
             # Text sampling
             guided_text = apply_classifier_guidance(buffers.text, False, 1.0, 50)
             text_token = sample_token(guided_text[:1], temp=temperature, top_k=top_k).item()
+
+            # Low-latency kick: force the first frame to consume the first entry.
+            # This forces an ACTION (new_word), not raw word-piece tokens.
+            if t == start_step and entries:
+                text_token = token_ids.new_word
             
             # State machine
             main_token, aux_token, _ = runtime.machine.process(t, state, text_token)
@@ -559,6 +581,9 @@ def _run_tts(
                 codebook_token = audio_buf[:, 0, t + 1]
             else:
                 codebook_token = sample_audio_logits(masked_cb0, temperature, top_k)
+
+            # Debug guard: ensure cb0 token is safe for Depformer/Mimi
+            _cuda_dbg_check_audio_token_range(f"gen:cb0 t={t}", codebook_token)
             
             audio_buf[:, 0, t + 1] = codebook_token
             
@@ -583,6 +608,8 @@ def _run_tts(
                     stage_token = audio_buf[:, stage + 1, t + 1]
                 else:
                     stage_token = sample_audio_logits(dep_logits[:1], temperature, top_k)
+
+                _cuda_dbg_check_audio_token_range(f"gen:dep stage={stage} t={t}", stage_token)
                 
                 audio_buf[:, stage + 1, t + 1] = stage_token
                 prev_audio = stage_token.expand(branches)
@@ -613,12 +640,12 @@ def _run_tts(
                     runtime.audio_delays,
                     token_ids.audio_pad
                 ).unsqueeze(0)
+
+                # IMPORTANT: Dia2 may carry special audio IDs (e.g. audio_bos/audio_pad) in the delayed grid.
+                # Never clamp to 2047 (that turns specials into a real token and can sound like a burst).
+                aligned = _sanitize_mimi_tokens(aligned)
                 
-                # Safety clamp to valid codebook range (0-2047)
-                # This prevents CUDA errors if audio_pad (2048) leaks into Mimi
-                aligned = torch.clamp(aligned, 0, 2047)
-                
-                torch.cuda.synchronize()
+                _cuda_dbg_sync("pre-mimi-decode")
                 pcm = runtime.mimi.decode(aligned)
                 full_waveform = torch.clamp(pcm[0, 0], -1.0, 1.0)
                 
