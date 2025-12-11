@@ -1,0 +1,12 @@
+.venv
+_kyutai
+__pycache__
+*.npz
+*.safetensors
+*.model
+*.DS_Store
+*.parquet
+*.wav
+*.mp3
+weights/
+*.egg-info/
