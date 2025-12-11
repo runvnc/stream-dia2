@@ -438,6 +438,12 @@ def _run_tts(
         audio_buf = gen.audio_buf
         branches = step_tokens.shape[0]
 
+        # Determine start step
+        start_step = 0
+        if session.snapshot:
+            start_step = session.snapshot.start_step
+            print(f"[Dia2] Resuming from cached state at step {start_step}")
+
         # FIX: Clear residual text tokens from prefix to prevent hallucination
         # This ensures the first transformer pass sees a 'new_word' token instead of the last prefix token
         # We set it to 'new_word' to match the state machine's expectation for the start of new text.
@@ -453,12 +459,6 @@ def _run_tts(
         max_delay = int(delay_tensor.max().item()) if delay_tensor.numel() else 0
         flush_tail = max_delay + getattr(runtime.machine, "max_padding", 0)
         print(f"[Dia2] max_delay: {max_delay} frames")
-        
-        # Determine start step
-        start_step = 0
-        if session.snapshot:
-            start_step = session.snapshot.start_step
-            print(f"[Dia2] Resuming from cached state at step {start_step}")
         
         positions_view = positions.expand(branches, -1)
         
