@@ -512,11 +512,6 @@ def _run_tts(
             gen.reset_dep_cache()
             positions.fill_(t)
             _fill_audio_channels(step_tokens, audio_buf, delay_tensor, t, token_ids.audio_bos)
-
-            # FIX: Force audio channels to BOS at the start to break context from prefix
-            # This prevents the model from continuing the prefix audio/text pattern
-            if t == start_step:
-                step_tokens[:, 2:, 0] = token_ids.audio_bos
             
             # FIX: Force audio channels to BOS at the start to break context from prefix
             # This prevents the model from continuing the prefix audio/text pattern
