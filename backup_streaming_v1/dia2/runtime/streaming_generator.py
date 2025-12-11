@@ -163,6 +163,8 @@ def run_streaming_generation(
     # Track how many frames we've generated (for buffering before first decode)
     frames_generated = 0
     
+    t_first_frame_start = None
+    
     with torch.inference_mode():
         for offset in range(max_context):
             t = start_step + offset
@@ -171,6 +173,9 @@ def run_streaming_generation(
                 break
             if t + 1 >= audio_buf.shape[-1]:
                 break
+            
+            if t_first_frame_start is None:
+                t_first_frame_start = time.perf_counter()
             
             generation.reset_dep_cache()
             positions.fill_(t)
@@ -189,6 +194,8 @@ def run_streaming_generation(
                     buffers,
                 )
             else:
+                t_before_transformer = time.perf_counter()
+                
                 transformer_capture, dep_captures = _execute_transformer_graph(
                     runtime=runtime,
                     step_tokens=step_tokens,
@@ -201,6 +208,10 @@ def run_streaming_generation(
                     dep_captures=dep_captures,
                 )
                 hidden_t = transformer_capture[1]
+                
+                if offset == 0:
+                    t_after_transformer = time.perf_counter()
+                    print(f"[streaming] Transformer (frame 0): {(t_after_transformer - t_before_transformer)*1000:.0f}ms")
                 
                 # Update cache after first capture
                 if cached_graphs is not None and cached_graphs.transformer_capture is None:
@@ -244,6 +255,9 @@ def run_streaming_generation(
             main_tokens.fill_(main_token)
             aux_tokens.fill_(second_token)
             
+            if offset == 0:
+                t_before_depformer = time.perf_counter()
+            
             for stage in range(runtime.model.depformer.num_depth):
                 if use_graph and dep_captures is not None:
                     dep_captures[stage] = _execute_depformer_graph(
@@ -281,6 +295,10 @@ def run_streaming_generation(
                 )
                 audio_buf[:, stage + 1, t + 1] = stage_token
                 prev_audio = stage_token.expand(branches)
+            
+            if offset == 0:
+                t_after_depformer = time.perf_counter()
+                print(f"[streaming] Depformer (frame 0): {(t_after_depformer - t_before_depformer)*1000:.0f}ms")
             
             frames_generated = offset + 1
             frame_time = time.perf_counter()
