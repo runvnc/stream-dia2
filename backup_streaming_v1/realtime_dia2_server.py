@@ -71,18 +71,37 @@ def _set_seed_if_needed():
 
 
 def _warmup_model() -> None:
+    """Warmup using the STREAMING generator to compile those CUDA kernels."""
     try:
         _set_seed_if_needed()
         cfg = GenerationConfig(
-            cfg_scale=2.0,
+            cfg_scale=1.0,  # No CFG for faster warmup
             text=SamplingConfig(temperature=0.6, top_k=50),
             audio=SamplingConfig(temperature=0.8, top_k=50),
-            use_cuda_graph=True,
+            use_cuda_graph=False,  # Disable for warmup
         )
-        print("[Dia2] Running warm-up generation...")
-        # Simple warmup - just run a generation to warm up CUDA
-        _ = dia.generate("[S1] Warm up.", config=cfg, output_wav=None, verbose=False)
-        print("[Dia2] Warm-up complete.")
+        print("[Dia2] Running STREAMING warm-up generation...")
+        
+        # Use the streaming generator for warmup so those kernels get compiled
+        runtime = dia._ensure_runtime()
+        normalized_text = normalize_script("[S1] Hello.")
+        entries = list(parse_script([normalized_text], runtime.tokenizer, runtime.constants, runtime.frame_rate))
+        runtime.machine.initial_padding = cfg.initial_padding
+        state = runtime.machine.new_state(entries)
+        gen_state = build_initial_state(runtime, prefix=None)
+        
+        # Run through streaming generator to warm up
+        for chunk in run_streaming_generation(
+            runtime,
+            state=state,
+            generation=gen_state,
+            config=cfg,
+            start_step=0,
+            chunk_frames=1,
+        ):
+            pass  # Just run through to compile kernels
+        
+        print("[Dia2] Streaming warm-up complete.")
     except Exception as e:
         print(f"[Dia2] Warm-up failed: {e}")
 
