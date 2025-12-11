@@ -509,7 +509,6 @@ def _run_tts(
                 
                 # Calculate window based on current step t
                 # We want the window to end at t + 2
-                decode_start_frame = min(decode_start_frame, t)  # Safety: never start after current frame
                 end_pos = t + 2
                 decode_start_frame = max(0, end_pos - context_window)
                 
