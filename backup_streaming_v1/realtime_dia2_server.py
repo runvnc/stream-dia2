@@ -28,7 +28,7 @@ def _parse_args():
     parser = argparse.ArgumentParser(description="Dia2 Streaming TTS Server")
     parser.add_argument("--port", type=int, default=3030, help="Server port")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Server host")
-    parser.add_argument("--prefix-audio", type=str, default="prefix.wav", help="Path to prefix audio for voice cloning")
+    parser.add_argument("--prefix-audio", type=str, default=os.path.abspath("prefix.wav"), help="Path to prefix audio for voice cloning")
     parser.add_argument("--seed", type=int, help="Random seed for reproducible generation")
     args, _ = parser.parse_known_args()
     return args
@@ -201,6 +201,10 @@ def _create_session() -> VoiceSession:
     
     if _args.prefix_audio and os.path.exists(_args.prefix_audio):
         print(f"[Dia2] Processing voice prefix: {_args.prefix_audio}...")
+    else:
+        print(f"[Dia2] WARNING: Prefix audio not found at {_args.prefix_audio}. Starting without voice clone.")
+
+    if _args.prefix_audio and os.path.exists(_args.prefix_audio):
         t_prefix = time.perf_counter()
         
         # Reset state before prefix warmup
@@ -399,7 +403,9 @@ def _run_tts(
         t_setup = time.perf_counter()
         print(f"[Dia2] Setup: {(t_setup - t_start)*1000:.0f}ms")
         
-        max_frames = 500  # Safety limit
+        # Allow generation up to 1500 frames beyond start
+        max_frames = start_step + 1500
+        print(f"[Dia2] Starting at step {start_step}, max_frames {max_frames}")
         
         for t in range(start_step, max_frames):
             if eos_cutoff is not None and t >= eos_cutoff:
