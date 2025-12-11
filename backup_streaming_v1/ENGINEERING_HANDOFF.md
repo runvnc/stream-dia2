@@ -65,4 +65,4 @@ The next agent should focus on reducing the **buffering delay** without breaking
 **Status:** Implemented
 **Changes:**
 - **Voice Consistency:** Added logic to reset the random seed (if provided via `--seed`) at the start of *every* request. This ensures the same "random" voice is generated for every connection.
-- **Audio Quality:** Increased initial buffer from 3 frames to **8 frames** (~400ms). This eliminates the "unusable" start by providing sufficient context for the vocoder while keeping latency under 500ms.
+- **Audio Quality:** Increased initial buffer from 3 frames to **15 frames** (~375ms). This eliminates the "unusable" start by providing sufficient context for the vocoder while keeping latency under 500ms.
