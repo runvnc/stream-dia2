@@ -380,3 +380,23 @@ async def stream_tts(ws: WebSocket):
             except:
                 pass
         print("[Dia2] Connection closed, cleaned up temp files")
+
+
+if __name__ == "__main__":
+    import argparse
+    import uvicorn
+    
+    parser = argparse.ArgumentParser(description="Dia2 Streaming TTS Server")
+    parser.add_argument("--port", type=int, default=3030, help="Server port")
+    parser.add_argument("--host", type=str, default="0.0.0.0", help="Server host")
+    parser.add_argument("--seed", type=int, help="Random seed for reproducible generation")
+    args = parser.parse_args()
+    
+    if args.seed is not None:
+        print(f"[Dia2] Setting random seed to {args.seed}")
+        torch.manual_seed(args.seed)
+        torch.cuda.manual_seed(args.seed)
+        np.random.seed(args.seed)
+    
+    print(f"[Dia2] Starting server on {args.host}:{args.port}")
+    uvicorn.run(app, host=args.host, port=args.port)
