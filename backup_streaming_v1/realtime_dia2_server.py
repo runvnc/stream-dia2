@@ -40,6 +40,7 @@ def _parse_args():
     parser.add_argument("--port", type=int, default=3030, help="Server port")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Server host")
     parser.add_argument("--prefix-audio", type=str, default=os.path.abspath("prefix.wav"), help="Path to prefix audio for voice cloning")
+    parser.add_argument("--prefix-speaker-2", type=str, default=None, help="Path to prefix audio for Speaker 2")
     parser.add_argument("--seed", type=int, help="Random seed for reproducible generation")
     args, _ = parser.parse_known_args()
     return args
@@ -248,7 +249,12 @@ def _create_session() -> VoiceSession:
             print(f"[Dia2] Audio loaded: shape={audio.shape}, max={audio.max()}, min={audio.min()}")
             return audio
 
-        prefix_cfg = PrefixConfig(speaker_1=_args.prefix_audio)
+        s2_path = _args.prefix_speaker_2
+        if s2_path and not os.path.exists(s2_path):
+            print(f"[Dia2] Warning: Speaker 2 prefix not found at {s2_path}, ignoring.")
+            s2_path = None
+
+        prefix_cfg = PrefixConfig(speaker_1=_args.prefix_audio, speaker_2=s2_path)
         prefix_plan = build_prefix_plan(runtime, prefix_cfg, load_audio_fn=safe_load_audio)
         
         # Safety: Truncate prefix if it exceeds context limits
@@ -474,14 +480,8 @@ def _run_tts(
             guided_text = apply_classifier_guidance(buffers.text, False, 1.0, 50)
             text_token = sample_token(guided_text[:1], temp=temperature, top_k=top_k).item()
             
-            # Force new_word at the start to ensure we switch to the new text immediately
-            is_forced = False
-            if t == start_step:
-                text_token = token_ids.new_word
-                is_forced = True
-
             # State machine
-            main_token, aux_token, _ = runtime.machine.process(t, state, text_token, is_forced=is_forced)
+            main_token, aux_token, _ = runtime.machine.process(t, state, text_token)
             step_tokens[:, 0, 0] = main_token
             step_tokens[:, 1, 0] = aux_token if aux_token != -1 else token_ids.pad
             
