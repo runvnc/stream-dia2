@@ -390,16 +390,11 @@ def _run_tts(
         
         # If we have a prefix, calculate its length in samples so we can skip it in output
         if session.prefix_plan:
-            # Decode prefix to establish baseline
-            # We use the full aligned length from the plan to ensure we skip the ENTIRE prefix
-            prefix_len = session.prefix_plan.aligned_frames
-            # We need to decode the full delayed buffer to get the accurate sample count
-            # But simpler: just estimate samples from frames (since we want to skip exactly that many frames)
-            # Actually, let's just use the plan's aligned_tokens which are already undelayed
-            with torch.inference_mode():
-                # Decode the original aligned tokens to get exact sample count
-                pcm = runtime.mimi.decode(session.prefix_plan.aligned_tokens.unsqueeze(0).to(runtime.device))
-                total_samples_output = pcm.shape[-1]
+            # Initialize total_samples_output based on start_step
+            # This ensures we skip exactly what was pre-calculated in the state
+            # We assume 320 samples per frame (24000 / 75)
+            samples_per_frame = 320
+            total_samples_output = start_step * samples_per_frame
             print(f"[Dia2] Prefix length: {total_samples_output} samples. Skipping these in output.")
         
         # Reset seed for consistent voice if specified
@@ -509,20 +504,13 @@ def _run_tts(
                 # OPTIMIZATION: Use a sliding window to avoid re-decoding the entire history
                 # We need some context for the vocoder to be stable (e.g. 50 frames / ~0.6s)
                 samples_per_frame = 320  # 24000 / 75
-                frames_output = total_samples_output // samples_per_frame
                 context_window = 50
                 
-                decode_start_frame = max(0, frames_output - context_window)
-                
-                # Safety: Ensure window is valid for undelay_frames (must have > max_delay frames)
-                # end_pos - start must be > max_delay
-                # start < end_pos - max_delay
-                # Use max_delay + 8 to be safe for Mimi kernel sizes
-                max_start = max(0, end_pos - (max_delay + 8))
-                decode_start_frame = min(decode_start_frame, max_start)
-                
+                # Calculate window based on current step t
+                # We want the window to end at t + 2
                 decode_start_frame = min(decode_start_frame, t)  # Safety: never start after current frame
                 end_pos = t + 2
+                decode_start_frame = max(0, end_pos - context_window)
                 
                 delayed_tokens = audio_buf[0, :, decode_start_frame:end_pos].clone()
                 
