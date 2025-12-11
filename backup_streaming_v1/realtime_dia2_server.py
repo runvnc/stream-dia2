@@ -516,7 +516,7 @@ def _run_tts(
                 
                 print(f"[Dia2] Debug: t={t}, decode_start={decode_start_frame}, end_pos={end_pos}, raw_len={delayed_tokens.shape[-1]}")
                 # Safety: Pad with silence if context is too short for Mimi (prevents kernel size error)
-                min_context = max_delay + 16  # Ensure enough frames remain after undelay
+                min_context = max_delay + 50  # Increase safety margin to 50 frames (~0.6s)
                 if delayed_tokens.shape[-1] < min_context:
                     pad_amt = min_context - delayed_tokens.shape[-1]
                     delayed_tokens = F.pad(delayed_tokens, (pad_amt, 0), value=token_ids.audio_pad)
