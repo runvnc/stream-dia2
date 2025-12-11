@@ -259,29 +259,17 @@ def run_streaming_generation(
                 t_before_depformer = time.perf_counter()
             
             for stage in range(runtime.model.depformer.num_depth):
-                if use_graph and dep_captures is not None:
-                    dep_captures[stage] = _execute_depformer_graph(
-                        stage=stage,
-                        prev_audio=prev_audio,
-                        hidden_t=hidden_t,
-                        generation=generation,
-                        depformer_step=depformer_step,
-                        main_tokens=main_tokens,
-                        aux_tokens=aux_tokens,
-                        buffers=buffers,
-                        capture=dep_captures[stage],
-                    )
-                else:
-                    _execute_depformer_stage(
-                        stage_index=stage,
-                        prev_audio=prev_audio,
-                        hidden_t=hidden_t,
-                        generation=generation,
-                        depformer_step=depformer_step,
-                        main_tokens=main_tokens,
-                        second_tokens=aux_tokens,
-                        buffers=buffers,
-                    )
+                # Use eager execution for depformer - graph capture is too slow (2.4s for 8 stages)
+                _execute_depformer_stage(
+                    stage_index=stage,
+                    prev_audio=prev_audio,
+                    hidden_t=hidden_t,
+                    generation=generation,
+                    depformer_step=depformer_step,
+                    main_tokens=main_tokens,
+                    second_tokens=aux_tokens,
+                    buffers=buffers,
+                )
                 
                 dep_logits = apply_classifier_guidance(
                     buffers.dep[stage], cfg_active, config.cfg_scale, config.cfg_filter_k
