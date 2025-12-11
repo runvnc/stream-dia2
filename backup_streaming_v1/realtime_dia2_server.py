@@ -408,13 +408,16 @@ def _run_tts(
         fade_samples = 4800  # ~200ms at 24kHz
         
         # If we have a prefix, calculate its length in samples so we can skip it in output
-        if start_step > 0:
+        if session.prefix_plan:
             # Decode prefix to establish baseline
-            prefix_end = start_step + 1
-            prefix_tokens = audio_buf[0, :, :prefix_end].clone()
-            aligned = undelay_frames(prefix_tokens, runtime.audio_delays, token_ids.audio_pad).unsqueeze(0)
+            # We use the full aligned length from the plan to ensure we skip the ENTIRE prefix
+            prefix_len = session.prefix_plan.aligned_frames
+            # We need to decode the full delayed buffer to get the accurate sample count
+            # But simpler: just estimate samples from frames (since we want to skip exactly that many frames)
+            # Actually, let's just use the plan's aligned_tokens which are already undelayed
             with torch.inference_mode():
-                pcm = runtime.mimi.decode(aligned.to(runtime.device))
+                # Decode the original aligned tokens to get exact sample count
+                pcm = runtime.mimi.decode(session.prefix_plan.aligned_tokens.unsqueeze(0).to(runtime.device))
                 total_samples_output = pcm.shape[-1]
             print(f"[Dia2] Prefix length: {total_samples_output} samples. Skipping these in output.")
         
@@ -432,6 +435,8 @@ def _run_tts(
         max_frames = start_step + 1500
         print(f"[Dia2] Starting at step {start_step}, max_frames {max_frames}")
         
+        prefix_frames = session.prefix_plan.aligned_frames if session.prefix_plan else 0
+
         for t in range(start_step, max_frames):
             if eos_cutoff is not None and t >= eos_cutoff:
                 break
@@ -462,7 +467,13 @@ def _run_tts(
             # Audio sampling
             guided_cb0 = apply_classifier_guidance(buffers.cb0, False, 1.0, 50)
             masked_cb0 = mask_audio_logits(guided_cb0[:1], token_ids.audio_pad, token_ids.audio_bos)
-            codebook_token = sample_audio_logits(masked_cb0, temperature, top_k)
+            
+            # Force ground truth if within prefix
+            if t < prefix_frames:
+                codebook_token = audio_buf[:, 0, t + 1]
+            else:
+                codebook_token = sample_audio_logits(masked_cb0, temperature, top_k)
+            
             audio_buf[:, 0, t + 1] = codebook_token
             
             prev_audio = codebook_token.expand(branches)
@@ -478,7 +489,15 @@ def _run_tts(
                 dep_captures[stage]["graph"].replay()
                 
                 dep_logits = apply_classifier_guidance(buffers.dep[stage], False, 1.0, 50)
-                stage_token = sample_audio_logits(dep_logits[:1], temperature, top_k)
+                
+                # Force ground truth if within prefix (accounting for delay)
+                # Channel k (stage+1) is at audio frame t - delay
+                delay = runtime.audio_delays[stage + 1]
+                if (t - delay) < prefix_frames:
+                    stage_token = audio_buf[:, stage + 1, t + 1]
+                else:
+                    stage_token = sample_audio_logits(dep_logits[:1], temperature, top_k)
+                
                 audio_buf[:, stage + 1, t + 1] = stage_token
                 prev_audio = stage_token.expand(branches)
             
