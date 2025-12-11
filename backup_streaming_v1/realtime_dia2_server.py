@@ -240,7 +240,7 @@ def _create_session() -> VoiceSession:
         
         # Run warmup (fills KV cache)
         start_step = warmup_with_prefix(runtime, prefix_plan, state, gen_state)
-        print(f"[Dia2] Warmup complete. Aligned frames: {prefix_plan.aligned_frames}, Start step: {start_step}")
+        print(f"[Dia2] Warmup complete. Aligned frames: {prefix_plan.aligned_frames}, Tokens shape: {prefix_plan.aligned_tokens.shape}, Start step: {start_step}")
         print(f"[Dia2] Warmup complete. Aligned frames: {prefix_plan.aligned_frames}, Start step: {start_step}")
         
         # Save snapshot
@@ -519,6 +519,12 @@ def _run_tts(
                 
                 delayed_tokens = audio_buf[0, :, decode_start_frame:end_pos].clone()
                 
+                # Safety: Pad with silence if context is too short for Mimi (prevents kernel size error)
+                min_context = 20
+                if delayed_tokens.shape[-1] < min_context:
+                    pad_amt = min_context - delayed_tokens.shape[-1]
+                    delayed_tokens = F.pad(delayed_tokens, (pad_amt, 0), value=token_ids.audio_pad)
+
                 aligned = undelay_frames(
                     delayed_tokens,
                     runtime.audio_delays,
