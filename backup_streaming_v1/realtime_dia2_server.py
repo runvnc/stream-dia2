@@ -220,6 +220,7 @@ def _run_streaming_generation(
         
         include_prefix_audio = include_prefix
         
+        print(f"[Dia2] Starting streaming generation: chunk_frames=1, cfg_scale={cfg_scale}, temp={temperature}")
         chunk_count = 0
         for chunk in run_streaming_generation(
             runtime,
