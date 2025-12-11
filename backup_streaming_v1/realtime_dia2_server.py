@@ -268,6 +268,7 @@ def _run_tts(
         delay_tensor = runtime.audio_delay_tensor
         max_delay = int(delay_tensor.max().item()) if delay_tensor.numel() else 0
         flush_tail = max_delay + getattr(runtime.machine, "max_padding", 0)
+        print(f"[Dia2] max_delay: {max_delay} frames")
         
         positions_view = positions.expand(branches, -1)
         
@@ -350,20 +351,16 @@ def _run_tts(
             is_final = (eos_cutoff is not None and t + 1 >= eos_cutoff)
             
             # Decode when we have enough frames
-            # Strategy: Wait for 15 frames (~375ms gen time) to minimize artifacts while keeping <500ms latency
-            min_frames = 15
-            should_decode = (frames_generated >= min_frames and frames_generated % 4 == 0) or is_final
+            # Strategy: Wait for full alignment (max_delay + 1) to ensure clean audio.
+            # With ~25ms/frame generation, 19 frames is ~475ms latency.
+            frames_before_decode = max_delay + 1
+            should_decode = (frames_generated >= frames_before_decode and frames_generated % 3 == 0) or is_final
             
             if should_decode:
                 # Undelay and decode
                 end_pos = frames_generated + 1
                 delayed_tokens = audio_buf[0, :, :end_pos].clone()
                 
-                # Pad with silence if we don't have enough frames for max_delay
-                if delayed_tokens.shape[-1] <= max_delay:
-                    pad_amt = (max_delay + 1) - delayed_tokens.shape[-1]
-                    delayed_tokens = F.pad(delayed_tokens, (0, pad_amt), value=token_ids.audio_pad)
-
                 aligned = undelay_frames(
                     delayed_tokens,
                     runtime.audio_delays,
