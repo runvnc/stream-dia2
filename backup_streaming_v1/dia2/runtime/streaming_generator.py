@@ -282,10 +282,11 @@ def run_streaming_generation(
                 audio_buf[:, stage + 1, t + 1] = stage_token
                 prev_audio = stage_token.expand(branches)
             
-            # Sync after each frame to ensure true streaming (not batching all GPU work)
+            # Sync after each frame to ensure GPU work is complete
             torch.cuda.synchronize()
             
             frames_generated = offset + 1
+            frame_time = time.perf_counter()
             
             if first_frame_time is None:
                 first_frame_time = time.perf_counter()
@@ -301,7 +302,11 @@ def run_streaming_generation(
             can_decode = frames_generated >= frames_before_decode
             should_decode = can_decode and (frames_generated % chunk_frames == 0 or is_final)
             
+            if frames_generated <= 25 or frames_generated % 10 == 0:
+                print(f"[streaming] Frame {frames_generated}: t={t}, can_decode={can_decode}, should_decode={should_decode}, is_final={is_final}, time={frame_time - t_loop_start:.3f}s")
+            
             if should_decode:
+                decode_start = time.perf_counter()
                 # Get all generated frames and undelay them to align codebooks
                 end_pos = start_step + frames_generated + 1
                 delayed_tokens = audio_buf[0, :, start_step:end_pos].clone()
@@ -333,6 +338,8 @@ def run_streaming_generation(
                     if first_audio_time is None:
                         first_audio_time = time.perf_counter()
                         print(f"[streaming] First audio: {(first_audio_time - t_loop_start)*1000:.0f}ms")
+                    
+                    print(f"[streaming] Yielding chunk {chunks_sent+1}: {waveform.shape[0]} samples, decode took {(time.perf_counter()-decode_start)*1000:.0f}ms")
                     
                     chunks_sent += 1
                     total_samples_output += waveform.shape[0]
