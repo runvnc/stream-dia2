@@ -397,6 +397,12 @@ def _run_tts(
                     runtime.machine.process(t, state, forced, is_forced=True)
                     start_step = t + 1
                 print(f"[Dia2] Extended fast-forward to step {start_step}")
+            
+            # CRITICAL: Clear any leftover tokens from the prefix.
+            # The state machine might still have tokens in its queue if the prefix audio was fast.
+            # We must clear them so they aren't re-emitted as output.
+            state.pending_tokens.clear()
+            state.lookahead_tokens.clear()
         
         positions_view = positions.expand(branches, -1)
         
