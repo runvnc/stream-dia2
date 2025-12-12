@@ -214,24 +214,30 @@ def _run_streaming_generation(
         
         normalized_text = normalize_script(text)
         
-        # DON'T include prefix entries - they were only for warmup, not generation
-        # Including them causes the model to re-generate the prefix transcript
-        entries = []
-        entries.extend(parse_script(
+        # Parse new text entries
+        new_entries = list(parse_script(
             [normalized_text], 
             runtime.tokenizer, 
             runtime.constants, 
             runtime.frame_rate
         ))
         
-        runtime.machine.initial_padding = base_config.initial_padding
-        state = runtime.machine.new_state(entries)
         gen_state = build_initial_state(runtime, prefix=prefix_plan)
         
         start_step = 0
         if prefix_plan is not None:
-            start_step = warmup_with_prefix(runtime, prefix_plan, state, gen_state)
+            # Create warmup state with prefix entries (for warmup_with_prefix)
+            # This state gets consumed during warmup
+            warmup_entries = list(prefix_plan.entries)
+            runtime.machine.initial_padding = base_config.initial_padding
+            warmup_state = runtime.machine.new_state(warmup_entries)
+            start_step = warmup_with_prefix(runtime, prefix_plan, warmup_state, gen_state)
             print(f"[Dia2] Prefix warmup done, start_step={start_step}")
+        
+        # Create generation state with ONLY new entries (not prefix)
+        # This ensures we generate the new text, not re-generate prefix transcript
+        runtime.machine.initial_padding = base_config.initial_padding
+        gen_state_machine = runtime.machine.new_state(new_entries)
         
         include_prefix_audio = include_prefix
         
@@ -239,7 +245,7 @@ def _run_streaming_generation(
         chunk_count = 0
         for chunk in run_streaming_generation(
             runtime,
-            state=state,
+            state=gen_state_machine,
             generation=gen_state,
             config=base_config,
             start_step=start_step,
