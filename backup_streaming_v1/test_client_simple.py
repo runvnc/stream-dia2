@@ -9,41 +9,12 @@ import time
 import numpy as np
 import websockets
 
-# Try multiple audio backends
-AUDIO_BACKEND = None
-
-# Try pyaudio first (more reliable on many systems)
 try:
-    import pyaudio
-    AUDIO_BACKEND = "pyaudio"
-    print("[audio] Using pyaudio backend")
+    import sounddevice as sd
+    HAS_AUDIO = True
 except ImportError:
-    pass
-
-# Try sounddevice as fallback
-if AUDIO_BACKEND is None:
-    try:
-        import sounddevice as sd
-        AUDIO_BACKEND = "sounddevice"
-        print("[audio] Using sounddevice backend")
-    except (ImportError, OSError) as e:
-        print(f"[warn] sounddevice not available: {e}")
-
-# Try pygame as another fallback
-if AUDIO_BACKEND is None:
-    try:
-        import pygame
-        pygame.mixer.init(frequency=24000, size=-16, channels=1, buffer=1024)
-        AUDIO_BACKEND = "pygame"
-        print("[audio] Using pygame backend")
-    except (ImportError, pygame.error) as e:
-        print(f"[warn] pygame not available: {e}")
-
-if AUDIO_BACKEND is None:
-    print("[warn] No audio backend available! Install pyaudio, sounddevice, or pygame")
-    print("[warn] To install: pip install pyaudio  OR  pip install sounddevice  OR  pip install pygame")
-
-HAS_AUDIO = AUDIO_BACKEND is not None
+    HAS_AUDIO = False
+    print("[warn] sounddevice not available, audio playback disabled")
 
 # Note: The simple server uses /ws/stream_tts endpoint
 WS_URL = "wss://gl54bysgz2dl7s-3030.proxy.runpod.net//ws/stream_tts"
@@ -55,95 +26,6 @@ def pcm16_to_float(pcm: bytes) -> np.ndarray:
         return np.zeros(0, dtype=np.float32)
     arr = np.frombuffer(pcm, dtype="<i2")
     return (arr.astype(np.float32) / 32767.0).clip(-1.0, 1.0)
-
-
-class AudioPlayer:
-    """Simple audio player that works with multiple backends."""
-    
-    def __init__(self, sample_rate=24000):
-        self.sample_rate = sample_rate
-        self.backend = AUDIO_BACKEND
-        self._stream = None
-        self._pa = None
-        self._buffer = []
-        
-    def start_stream(self):
-        """Start streaming playback."""
-        if self.backend == "pyaudio":
-            self._pa = pyaudio.PyAudio()
-            self._stream = self._pa.open(
-                format=pyaudio.paFloat32,
-                channels=1,
-                rate=self.sample_rate,
-                output=True,
-                frames_per_buffer=1024,
-            )
-        elif self.backend == "sounddevice":
-            self._stream = sd.OutputStream(
-                samplerate=self.sample_rate,
-                channels=1,
-                dtype='float32',
-                blocksize=1024,
-            )
-            self._stream.start()
-        elif self.backend == "pygame":
-            # Pygame doesn't support true streaming, so we buffer
-            self._buffer = []
-    
-    def write(self, audio_float: np.ndarray):
-        """Write audio samples to the stream."""
-        if self.backend == "pyaudio":
-            self._stream.write(audio_float.astype(np.float32).tobytes())
-        elif self.backend == "sounddevice":
-            self._stream.write(audio_float)
-        elif self.backend == "pygame":
-            # Buffer for pygame
-            self._buffer.append(audio_float)
-    
-    def stop_stream(self):
-        """Stop streaming playback."""
-        if self.backend == "pyaudio":
-            if self._stream:
-                self._stream.stop_stream()
-                self._stream.close()
-            if self._pa:
-                self._pa.terminate()
-        elif self.backend == "sounddevice":
-            if self._stream:
-                self._stream.stop()
-                self._stream.close()
-        elif self.backend == "pygame":
-            # Play buffered audio
-            if self._buffer:
-                all_audio = np.concatenate(self._buffer)
-                # Convert to int16 for pygame
-                audio_int16 = (all_audio * 32767).astype(np.int16)
-                sound = pygame.sndarray.make_sound(audio_int16)
-                sound.play()
-                pygame.time.wait(int(len(all_audio) / self.sample_rate * 1000))
-    
-    def play_all(self, audio_float: np.ndarray):
-        """Play all audio at once (non-streaming)."""
-        if self.backend == "pyaudio":
-            pa = pyaudio.PyAudio()
-            stream = pa.open(
-                format=pyaudio.paFloat32,
-                channels=1,
-                rate=self.sample_rate,
-                output=True,
-            )
-            stream.write(audio_float.astype(np.float32).tobytes())
-            stream.stop_stream()
-            stream.close()
-            pa.terminate()
-        elif self.backend == "sounddevice":
-            sd.play(audio_float, self.sample_rate)
-            sd.wait()
-        elif self.backend == "pygame":
-            audio_int16 = (audio_float * 32767).astype(np.int16)
-            sound = pygame.sndarray.make_sound(audio_int16)
-            sound.play()
-            pygame.time.wait(int(len(audio_float) / self.sample_rate * 1000))
 
 
 async def tts_request(text: str, ws_url: str = WS_URL, stream_playback: bool = True):
@@ -162,10 +44,15 @@ async def tts_request(text: str, ws_url: str = WS_URL, stream_playback: bool = T
         print(f"[client] Connected, sample_rate={sample_rate}")
         
         # Setup streaming playback
-        player = None
+        stream = None
         if stream_playback and HAS_AUDIO:
-            player = AudioPlayer(sample_rate)
-            player.start_stream()
+            stream = sd.OutputStream(
+                samplerate=sample_rate,
+                channels=1,
+                dtype='float32',
+                blocksize=1024,
+            )
+            stream.start()
         
         # Send TTS request (no voice cloning)
         request_time = time.time()
@@ -200,9 +87,9 @@ async def tts_request(text: str, ws_url: str = WS_URL, stream_playback: bool = T
                     print(f"[client] *** FIRST CHUNK LATENCY: {latency:.0f}ms ***")
                 
                 # Play immediately if streaming
-                if player is not None:
+                if stream is not None:
                     audio_float = pcm16_to_float(pcm_data)
-                    player.write(audio_float)
+                    stream.write(audio_float)
                     if chunk_count <= 5 or chunk_count % 10 == 0:
                         print(f"[client] Played chunk {chunk_count}: {len(audio_float)} samples")
                 
@@ -225,8 +112,9 @@ async def tts_request(text: str, ws_url: str = WS_URL, stream_playback: bool = T
                     print(f"[client] Event: {data}")
         
         # Stop streaming playback
-        if player is not None:
-            player.stop_stream()
+        if stream is not None:
+            stream.stop()
+            stream.close()
             total_time = time.time() - request_time
             print(f"[client] Streaming playback complete, total time: {total_time*1000:.0f}ms")
         
@@ -235,8 +123,8 @@ async def tts_request(text: str, ws_url: str = WS_URL, stream_playback: bool = T
             all_pcm = b"".join(audio_chunks)
             audio = pcm16_to_float(all_pcm)
             print(f"[client] Playing {len(audio)/sample_rate:.2f}s of audio...")
-            player = AudioPlayer(sample_rate)
-            player.play_all(audio)
+            sd.play(audio, sample_rate)
+            sd.wait()
         
         elif audio_chunks:
             all_pcm = b"".join(audio_chunks)
@@ -309,8 +197,8 @@ async def interactive_mode(ws_url: str = WS_URL):
                     all_pcm = b"".join(audio_chunks)
                     audio = pcm16_to_float(all_pcm)
                     print(f"  Playing {len(audio)/sample_rate:.2f}s...")
-                    player = AudioPlayer(sample_rate)
-                    player.play_all(audio)
+                    sd.play(audio, sample_rate)
+                    sd.wait()
                     
             except KeyboardInterrupt:
                 print("\n[client] Bye!")
