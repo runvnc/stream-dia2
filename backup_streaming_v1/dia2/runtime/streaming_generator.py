@@ -234,6 +234,10 @@ def run_streaming_generation(
             main_token, aux_token, _ = runtime.machine.process(t, state, text_token)
             second_token = aux_token if aux_token != -1 else token_ids.pad
             
+            # Debug: Log first 10 text tokens
+            if frames_generated < 10:
+                print(f"[streaming] DEBUG step {t}: sampled={text_token}, main={main_token}, aux={aux_token}, entries_left={len(state.entries)}")
+            
             if first_word_frame is None and main_token == token_ids.new_word:
                 first_word_frame = t - config.initial_padding
             

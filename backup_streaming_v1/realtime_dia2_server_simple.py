@@ -293,6 +293,10 @@ def _run_streaming_generation(
         runtime.machine.initial_padding = base_config.initial_padding
         state = runtime.machine.new_state(all_entries)  # SINGLE state machine
         
+        print(f"[Dia2] DEBUG: Total entries = {len(all_entries)}")
+        print(f"[Dia2] DEBUG: Prefix entries = {len(prefix_plan.entries) if prefix_plan else 0}")
+        print(f"[Dia2] DEBUG: New entries = {len(new_entries)}")
+        
         gen_state = build_initial_state(runtime, prefix=prefix_plan)
 
         start_step = 0
@@ -300,6 +304,8 @@ def _run_streaming_generation(
             # Warmup with the SAME state - prefix entries will be consumed
             start_step = warmup_with_prefix(runtime, prefix_plan, state, gen_state)
             print(f"[Dia2] Prefix warmup done, start_step={start_step}")
+            print(f"[Dia2] DEBUG: State after warmup - entries remaining: {len(state.entries)}")
+            print(f"[Dia2] DEBUG: State transcript so far: {state.transcript[:5]}...")  # First 5 words
         
         include_prefix_audio = include_prefix
         
