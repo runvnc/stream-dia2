@@ -26,6 +26,7 @@ def _parse_args():
     parser.add_argument("--seed", type=int, help="Random seed for reproducible generation")
     parser.add_argument("--prefix-audio", type=str, default=None, help="Path to prefix audio for voice cloning (Speaker 1)")
     parser.add_argument("--prefix-speaker-2", type=str, default=None, help="Path to prefix audio for Speaker 2")
+    parser.add_argument("--max-prefix-duration", type=float, default=1.0, help="Max prefix duration in seconds (0 to disable truncation)")
     # Only parse known args to avoid conflicts with uvicorn
     args, _ = parser.parse_known_args()
     return args
@@ -44,6 +45,7 @@ from dia2.runtime.generator import build_initial_state, warmup_with_prefix
 from dia2.runtime.streaming_generator import run_streaming_generation, StreamingChunk, CachedGraphs
 from dia2.runtime.script_parser import parse_script
 from dia2.runtime.voice_clone import build_prefix_plan
+from dia2.runtime.state_machine import Entry
 from dia2.generation import merge_generation_config, normalize_script, PrefixConfig
 
 
@@ -75,6 +77,7 @@ _global_seed = _args.seed
 # Store prefix paths from command line
 _default_prefix_speaker_1 = _args.prefix_audio
 _default_prefix_speaker_2 = _args.prefix_speaker_2
+_default_max_prefix_duration = _args.max_prefix_duration
 
 
 def _set_seed_if_needed():
@@ -153,6 +156,58 @@ def _get_cache_key(speaker_1: Optional[str], speaker_2: Optional[str]) -> str:
     return hashlib.md5(key.encode()).hexdigest()
 
 
+def _truncate_prefix_plan(prefix_plan, max_duration_sec: float, frame_rate: float = 12.5):
+    """
+    Truncate a prefix plan to a maximum duration.
+    This reduces text context pollution while keeping voice characteristics.
+    
+    Args:
+        prefix_plan: The original PrefixPlan object
+        max_duration_sec: Maximum duration in seconds
+        frame_rate: Frames per second (default 12.5 for Mimi)
+    
+    Returns:
+        A new PrefixPlan with truncated audio and entries
+    """
+    if prefix_plan is None:
+        return None
+    
+    max_frames = int(max_duration_sec * frame_rate)
+    
+    # If already short enough, return as-is
+    if prefix_plan.aligned_frames <= max_frames:
+        print(f"[Dia2] Prefix already <= {max_duration_sec}s ({prefix_plan.aligned_frames} frames)")
+        return prefix_plan
+    
+    # Truncate audio tokens
+    truncated_tokens = prefix_plan.aligned_tokens[:, :max_frames]
+    
+    # Filter entries to only those that fit within max_frames
+    # We need to estimate which entries fit based on new_word_steps
+    truncated_entries = []
+    truncated_steps = []
+    
+    for entry, step in zip(prefix_plan.entries, prefix_plan.new_word_steps):
+        if step < max_frames:
+            truncated_entries.append(entry)
+            truncated_steps.append(step)
+    
+    # Create a new PrefixPlan-like object
+    from dataclasses import dataclass
+    from typing import List
+    
+    class TruncatedPrefixPlan:
+        def __init__(self, entries, new_word_steps, aligned_tokens, aligned_frames):
+            self.entries = entries
+            self.new_word_steps = new_word_steps
+            self.aligned_tokens = aligned_tokens
+            self.aligned_frames = aligned_frames
+    
+    print(f"[Dia2] Truncated prefix: {prefix_plan.aligned_frames} -> {max_frames} frames, {len(prefix_plan.entries)} -> {len(truncated_entries)} entries")
+    
+    return TruncatedPrefixPlan(truncated_entries, truncated_steps, truncated_tokens, max_frames)
+
+
 def _build_and_cache_prefix(
     runtime,
     prefix_speaker_1: Optional[str],
@@ -187,6 +242,7 @@ def _run_streaming_generation(
     prefix_speaker_1: Optional[str] = None,
     prefix_speaker_2: Optional[str] = None,
     include_prefix: bool = False,
+    max_prefix_duration: float = 1.0,
     cfg_scale: float = 6.0,
     temperature: float = 0.8,
     top_k: int = 50,
@@ -212,6 +268,11 @@ def _run_streaming_generation(
         if prefix_speaker_1 or prefix_speaker_2:
             prefix_plan = _build_and_cache_prefix(runtime, prefix_speaker_1, prefix_speaker_2)
         
+        # Truncate prefix to minimize text context pollution
+        if prefix_plan is not None and max_prefix_duration > 0 and prefix_plan.aligned_frames > int(max_prefix_duration * runtime.frame_rate):
+            prefix_plan = _truncate_prefix_plan(prefix_plan, max_prefix_duration, runtime.frame_rate) 
+            print(f"[Dia2] Using truncated prefix: {prefix_plan.aligned_frames} frames ({prefix_plan.aligned_frames / runtime.frame_rate:.2f}s)")
+        
         normalized_text = normalize_script(text)
         
         # Parse new text entries
@@ -222,17 +283,17 @@ def _run_streaming_generation(
             runtime.frame_rate
         ))
         
-        # Build generation state - this populates audio_buf with prefix tokens if provided
         gen_state = build_initial_state(runtime, prefix=prefix_plan)
         
         start_step = 0
         if prefix_plan is not None:
-            # APPROACH #2: Mimi-only warmup (no transformer warmup)
-            # - Skip warmup_with_prefix() to avoid transformer KV cache text pollution
-            # - Set start_step so streaming_generator's Mimi warmup works
-            # - Transformer starts fresh - no text context bias from prefix
-            start_step = prefix_plan.aligned_frames
-            print(f"[Dia2] Using Mimi-only warmup (skip transformer), start_step={start_step}")
+            # Create warmup state with prefix entries (for warmup_with_prefix)
+            # This state gets consumed during warmup
+            warmup_entries = list(prefix_plan.entries)
+            runtime.machine.initial_padding = base_config.initial_padding
+            warmup_state = runtime.machine.new_state(warmup_entries)
+            start_step = warmup_with_prefix(runtime, prefix_plan, warmup_state, gen_state)
+            print(f"[Dia2] Prefix warmup done, start_step={start_step}")
         
         # Create generation state with ONLY new entries (not prefix)
         # This ensures we generate the new text, not re-generate prefix transcript
@@ -398,6 +459,7 @@ async def stream_tts(ws: WebSocket):
                         prefix_speaker_1=prefix_speaker_1,
                         prefix_speaker_2=prefix_speaker_2,
                         include_prefix=bool(payload.get("include_prefix", False)),
+                        max_prefix_duration=float(payload.get("max_prefix_duration", _default_max_prefix_duration)),
                         cfg_scale=float(payload.get("cfg_scale", 6.0)),
                         temperature=float(payload.get("temperature", 0.8)),
                         top_k=int(payload.get("top_k", 50)),
