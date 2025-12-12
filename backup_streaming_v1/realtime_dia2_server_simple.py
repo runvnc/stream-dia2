@@ -214,9 +214,9 @@ def _run_streaming_generation(
         
         normalized_text = normalize_script(text)
         
+        # DON'T include prefix entries - they were only for warmup, not generation
+        # Including them causes the model to re-generate the prefix transcript
         entries = []
-        if prefix_plan is not None:
-            entries.extend(prefix_plan.entries)
         entries.extend(parse_script(
             [normalized_text], 
             runtime.tokenizer, 

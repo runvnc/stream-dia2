@@ -138,10 +138,25 @@ def run_streaming_generation(
     sample_rate = runtime.mimi.sample_rate
     samples_per_frame = runtime.mimi.samples_per_frame
     
-    # Skip a small number of initial samples to avoid any startup transients.
-    # Previously this was max_delay * samples_per_frame which was way too much
-    # (skipping 1.4s out of 1.7s of audio!). Just skip ~2 frames worth.
+    # Warm up Mimi with prefix tokens so it learns the voice characteristics
+    # before we start outputting audio. Without this, Mimi starts "cold" and
+    # produces random voice for the first few frames.
     mimi_kv = None
+    if start_step > 0:
+        # Decode prefix tokens through Mimi streaming to warm it up
+        # We process in chunks to avoid memory issues
+        warmup_chunk_size = 50  # frames per chunk
+        for warmup_start in range(0, start_step, warmup_chunk_size):
+            warmup_end = min(warmup_start + warmup_chunk_size, start_step)
+            warmup_tokens = audio_buf[0:1, :, warmup_start:warmup_end].clone()
+            # Sanitize tokens
+            warmup_tokens[warmup_tokens >= 2048] = 0
+            warmup_tokens[warmup_tokens < 0] = 0
+            # Decode but discard output - we just want to warm up mimi_kv
+            _, mimi_kv = runtime.mimi.decode_streaming(warmup_tokens, mimi_kv)
+        print(f"[streaming] Warmed up Mimi with {start_step} prefix frames")
+    
+    # Skip a small number of initial samples to avoid any startup transients.
     samples_to_skip = 2 * samples_per_frame  # ~160ms at 24kHz
     print(f"[streaming] max_delay={max_delay}, samples_to_skip={samples_to_skip}")
     
