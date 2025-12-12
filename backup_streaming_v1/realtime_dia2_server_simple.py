@@ -26,7 +26,7 @@ def _parse_args():
     parser.add_argument("--seed", type=int, help="Random seed for reproducible generation")
     parser.add_argument("--prefix-audio", type=str, default=None, help="Path to prefix audio for voice cloning (Speaker 1)")
     parser.add_argument("--prefix-speaker-2", type=str, default=None, help="Path to prefix audio for Speaker 2")
-    parser.add_argument("--max-prefix-duration", type=float, default=1.0, help="Max prefix duration in seconds (0 to disable truncation)")
+    parser.add_argument("--max-prefix-duration", type=float, default=0, help="Max prefix duration in seconds (0 to disable truncation)")
     # Only parse known args to avoid conflicts with uvicorn
     args, _ = parser.parse_known_args()
     return args
@@ -272,7 +272,7 @@ def _run_streaming_generation(
         if prefix_plan is not None and max_prefix_duration > 0 and prefix_plan.aligned_frames > int(max_prefix_duration * runtime.frame_rate):
             prefix_plan = _truncate_prefix_plan(prefix_plan, max_prefix_duration, runtime.frame_rate) 
             print(f"[Dia2] Using truncated prefix: {prefix_plan.aligned_frames} frames ({prefix_plan.aligned_frames / runtime.frame_rate:.2f}s)")
-        
+
         normalized_text = normalize_script(text)
         
         # Parse new text entries
@@ -283,22 +283,23 @@ def _run_streaming_generation(
             runtime.frame_rate
         ))
         
-        gen_state = build_initial_state(runtime, prefix=prefix_plan)
+        # FIX: Use ONE state machine with ALL entries (prefix + new text)
+        # This matches the original Dia2 CLI behavior
+        all_entries = []
+        if prefix_plan is not None:
+            all_entries.extend(prefix_plan.entries)
+        all_entries.extend(new_entries)
         
+        runtime.machine.initial_padding = base_config.initial_padding
+        state = runtime.machine.new_state(all_entries)  # SINGLE state machine
+        
+        gen_state = build_initial_state(runtime, prefix=prefix_plan)
+
         start_step = 0
         if prefix_plan is not None:
-            # Create warmup state with prefix entries (for warmup_with_prefix)
-            # This state gets consumed during warmup
-            warmup_entries = list(prefix_plan.entries)
-            runtime.machine.initial_padding = base_config.initial_padding
-            warmup_state = runtime.machine.new_state(warmup_entries)
-            start_step = warmup_with_prefix(runtime, prefix_plan, warmup_state, gen_state)
+            # Warmup with the SAME state - prefix entries will be consumed
+            start_step = warmup_with_prefix(runtime, prefix_plan, state, gen_state)
             print(f"[Dia2] Prefix warmup done, start_step={start_step}")
-        
-        # Create generation state with ONLY new entries (not prefix)
-        # This ensures we generate the new text, not re-generate prefix transcript
-        runtime.machine.initial_padding = base_config.initial_padding
-        gen_state_machine = runtime.machine.new_state(new_entries)
         
         include_prefix_audio = include_prefix
         
@@ -306,7 +307,7 @@ def _run_streaming_generation(
         chunk_count = 0
         for chunk in run_streaming_generation(
             runtime,
-            state=gen_state_machine,
+            state=state,  # Use the SAME state that was warmed up!
             generation=gen_state,
             config=base_config,
             start_step=start_step,
