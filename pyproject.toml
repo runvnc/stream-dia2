@@ -9,7 +9,7 @@ authors = [
 
 dependencies = [
   # dia2 dependencies (vendored)
-  "torch>=2.8.0",
+  "torch>=2.8.0,<2.9.0",
   "numpy>=2.1.0,<3.0",
   "transformers>=4.55.3",
   "safetensors==0.5.3",
