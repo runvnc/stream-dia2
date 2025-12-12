@@ -61,10 +61,17 @@ def _parse_args():
     parser.add_argument("--prefix-speaker-2", type=str, default=None, help="Path to prefix audio for Speaker 2")
     parser.add_argument("--seed", type=int, help="Random seed for reproducible generation")
     parser.add_argument("--cuda-debug", action="store_true", help="Extra CUDA sync + asserts for debugging device-side asserts")
+    parser.add_argument("--trace-boundary", action="store_true", help="Verbose boundary tracing (prefix->request): tokens, crops, consumption")
+    parser.add_argument("--trace-steps", type=int, default=30, help="How many initial generation steps to trace when --trace-boundary is enabled")
     args, _ = parser.parse_known_args()
     return args
 
 _args = _parse_args()
+
+
+def _trace(msg: str) -> None:
+    if getattr(_args, "trace_boundary", False):
+        print(f"[Dia2][trace] {msg}")
 
 
 def _cuda_dbg_sync(label: str) -> None:
@@ -361,6 +368,17 @@ def _create_session() -> VoiceSession:
                 # Run transformer (updates KV cache)
                 transformer_capture[0].replay()
                 start_step += 1
+
+        # Trace what text tokens the snapshot ends on (these can bias the first request step)
+        if getattr(_args, "trace_boundary", False):
+            try:
+                m0 = int(gen_state.step_tokens[0, 0, 0].item())
+                s0 = int(gen_state.step_tokens[0, 1, 0].item())
+                dm = runtime.tokenizer.decode([m0], clean_up_tokenization_spaces=False)
+                ds = runtime.tokenizer.decode([s0], clean_up_tokenization_spaces=False)
+                _trace(f"snapshot ends with step_tokens main={m0}({dm!r}) second={s0}({ds!r}) start_step(after cooldown)={start_step+1} prefix_frames={prefix_plan.aligned_frames}")
+            except Exception as e:
+                _trace(f"snapshot token decode failed: {e}")
         
         # Save snapshot
         kv_snapshot = []
@@ -500,6 +518,17 @@ def _run_tts(
             start_step = session.snapshot.start_step
             print(f"[Dia2] Resuming from cached state at step {start_step}")
 
+        # Trace: prove/disprove (A) "old text tokens hanging around" by printing the snapshot step_tokens
+        if getattr(_args, "trace_boundary", False) and session.snapshot is not None:
+            try:
+                m0 = int(step_tokens[0, 0, 0].item())
+                s0 = int(step_tokens[0, 1, 0].item())
+                dm = runtime.tokenizer.decode([m0], clean_up_tokenization_spaces=False)
+                ds = runtime.tokenizer.decode([s0], clean_up_tokenization_spaces=False)
+                _trace(f"request start sees snapshot step_tokens main={m0}({dm!r}) second={s0}({ds!r})")
+            except Exception as e:
+                _trace(f"request snapshot token decode failed: {e}")
+
         # IMPORTANT:
         # Do NOT teacher-force raw word-piece tokens into step_tokens here.
         # Dia2 is trained on an action-level interface (pad/new_word) feeding a state machine.
@@ -517,12 +546,15 @@ def _run_tts(
         
         # If we have a prefix, calculate its length in samples so we can skip it in output
         if session.prefix_plan:
-            # Initialize total_samples_output based on start_step
-            # This ensures we skip exactly what was pre-calculated in the state
-            # We assume 320 samples per frame (24000 / 75)
-            samples_per_frame = 320
+            # Initialize total_samples_output based on start_step.
+            # IMPORTANT: do not hardcode samples/frame; use Mimi's actual value.
+            spf = getattr(runtime.mimi, "samples_per_frame", None)
+            if spf is None:
+                spf = int(round(runtime.mimi.sample_rate / max(runtime.frame_rate, 1e-6)))
+            samples_per_frame = int(spf)
             total_samples_output = start_step * samples_per_frame
             print(f"[Dia2] Prefix length: {total_samples_output} samples. Skipping these in output.")
+            _trace(f"mimi.sample_rate={runtime.mimi.sample_rate} runtime.frame_rate={runtime.frame_rate} mimi.samples_per_frame={getattr(runtime.mimi, 'samples_per_frame', None)} -> using samples_per_frame={samples_per_frame} crop_frames~={total_samples_output / max(samples_per_frame,1):.2f}")
         
         # Reset seed for consistent voice if specified
         if _args.seed is not None:
@@ -539,6 +571,9 @@ def _run_tts(
         print(f"[Dia2] Starting at step {start_step}, max_frames {max_frames}")
         
         prefix_frames = session.prefix_plan.aligned_frames if session.prefix_plan else 0
+        trace_steps = int(getattr(_args, "trace_steps", 30) or 0)
+        traced = 0
+        request_consumed = 0
 
         for t in range(start_step, max_frames):
             if eos_cutoff is not None and t >= eos_cutoff:
@@ -568,9 +603,24 @@ def _run_tts(
                 text_token = token_ids.new_word
             
             # State machine
-            main_token, aux_token, _ = runtime.machine.process(t, state, text_token)
+            main_token, aux_token, consumed_new_word = runtime.machine.process(t, state, text_token)
+            if consumed_new_word:
+                request_consumed += 1
             step_tokens[:, 0, 0] = main_token
             step_tokens[:, 1, 0] = aux_token if aux_token != -1 else token_ids.pad
+
+            # Trace a few initial steps: action + emitted tokens + consumption progress
+            if getattr(_args, "trace_boundary", False) and traced < trace_steps:
+                try:
+                    mt = int(main_token)
+                    at = int(aux_token if aux_token != -1 else token_ids.pad)
+                    # Only attempt decode for non-pad tokens (reduces spam)
+                    dm = runtime.tokenizer.decode([mt], clean_up_tokenization_spaces=False) if mt != token_ids.pad else "<PAD>"
+                    da = runtime.tokenizer.decode([at], clean_up_tokenization_spaces=False) if at != token_ids.pad else "<PAD>"
+                    _trace(f"t={t} action={int(text_token)} consumed_new_word={consumed_new_word} main={mt}({dm!r}) aux={at}({da!r}) consumed_entries={request_consumed}/{len(entries)} pending={len(state.pending_tokens)}")
+                except Exception as e:
+                    _trace(f"t={t} trace decode failed: {e}")
+                traced += 1
             
             # Audio sampling
             guided_cb0 = apply_classifier_guidance(buffers.cb0, False, 1.0, 50)
@@ -640,6 +690,27 @@ def _run_tts(
                     runtime.audio_delays,
                     token_ids.audio_pad
                 ).unsqueeze(0)
+
+                # Trace: prove/disprove (B) prefix audio leakage.
+                # If our implied crop_frames < prefix_frames, then we are still outputting some prefix audio.
+                if getattr(_args, "trace_boundary", False) and session.prefix_plan is not None and chunks_sent == 0:
+                    spf = getattr(runtime.mimi, "samples_per_frame", None)
+                    if spf is None:
+                        spf = int(round(runtime.mimi.sample_rate / max(runtime.frame_rate, 1e-6)))
+                    spf = max(int(spf), 1)
+                    crop_frames = total_samples_output / spf
+                    # Compare early aligned tokens against the original prefix aligned tokens
+                    try:
+                        K = int(min(64, session.prefix_plan.aligned_tokens.shape[1], aligned.shape[-1]))
+                        if K > 0:
+                            a0 = aligned[0, :, :K].detach()
+                            p0 = session.prefix_plan.aligned_tokens[:, :K].to(a0.device)
+                            match = (a0 == p0).float().mean().item()
+                            _trace(f"first decode: prefix_frames={prefix_frames} crop_frames~={crop_frames:.2f} K={K} token_prefix_match={match:.3f} (1.0 means aligned[0,:,:K] equals prefix tokens)")
+                            if crop_frames < prefix_frames:
+                                _trace("WARNING: crop_frames < prefix_frames => sample-skip would output some prefix audio tokens")
+                    except Exception as e:
+                        _trace(f"prefix token compare failed: {e}")
 
                 # IMPORTANT: Dia2 may carry special audio IDs (e.g. audio_bos/audio_pad) in the delayed grid.
                 # Never clamp to 2047 (that turns specials into a real token and can sound like a burst).
