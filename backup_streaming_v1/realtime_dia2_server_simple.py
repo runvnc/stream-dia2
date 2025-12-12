@@ -222,17 +222,17 @@ def _run_streaming_generation(
             runtime.frame_rate
         ))
         
+        # Build generation state - this populates audio_buf with prefix tokens if provided
         gen_state = build_initial_state(runtime, prefix=prefix_plan)
         
         start_step = 0
         if prefix_plan is not None:
-            # Create warmup state with prefix entries (for warmup_with_prefix)
-            # This state gets consumed during warmup
-            warmup_entries = list(prefix_plan.entries)
-            runtime.machine.initial_padding = base_config.initial_padding
-            warmup_state = runtime.machine.new_state(warmup_entries)
-            start_step = warmup_with_prefix(runtime, prefix_plan, warmup_state, gen_state)
-            print(f"[Dia2] Prefix warmup done, start_step={start_step}")
+            # APPROACH #2: Mimi-only warmup (no transformer warmup)
+            # - Skip warmup_with_prefix() to avoid transformer KV cache text pollution
+            # - Set start_step so streaming_generator's Mimi warmup works
+            # - Transformer starts fresh - no text context bias from prefix
+            start_step = prefix_plan.aligned_frames
+            print(f"[Dia2] Using Mimi-only warmup (skip transformer), start_step={start_step}")
         
         # Create generation state with ONLY new entries (not prefix)
         # This ensures we generate the new text, not re-generate prefix transcript
