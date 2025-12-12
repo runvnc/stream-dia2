@@ -15,6 +15,7 @@ from typing import Optional, List, Dict, Any
 import numpy as np
 import torch
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 # Parse args early so seed can be set before model load
@@ -23,6 +24,8 @@ def _parse_args():
     parser.add_argument("--port", type=int, default=3030, help="Server port")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Server host")
     parser.add_argument("--seed", type=int, help="Random seed for reproducible generation")
+    parser.add_argument("--prefix-audio", type=str, default=None, help="Path to prefix audio for voice cloning (Speaker 1)")
+    parser.add_argument("--prefix-speaker-2", type=str, default=None, help="Path to prefix audio for Speaker 2")
     # Only parse known args to avoid conflicts with uvicorn
     args, _ = parser.parse_known_args()
     return args
@@ -46,6 +49,14 @@ from dia2.generation import merge_generation_config, normalize_script, PrefixCon
 
 app = FastAPI()
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 MODEL_REPO = "nari-labs/Dia2-2B"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = "bfloat16"
@@ -60,6 +71,10 @@ _prefix_cache: Dict[str, Any] = {}
 
 # Store seed for use in generation
 _global_seed = _args.seed
+
+# Store prefix paths from command line
+_default_prefix_speaker_1 = _args.prefix_audio
+_default_prefix_speaker_2 = _args.prefix_speaker_2
 
 
 def _set_seed_if_needed():
@@ -258,8 +273,9 @@ async def stream_tts(ws: WebSocket):
     print("[Dia2] WebSocket connected")
     
     # Session state
-    prefix_speaker_1: Optional[str] = None
-    prefix_speaker_2: Optional[str] = None
+    # Use command-line defaults if provided
+    prefix_speaker_1: Optional[str] = _default_prefix_speaker_1
+    prefix_speaker_2: Optional[str] = _default_prefix_speaker_2
     temp_files: List[str] = []
     
     # Keepalive task
